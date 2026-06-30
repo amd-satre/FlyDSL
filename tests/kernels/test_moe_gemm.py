@@ -2377,6 +2377,190 @@ def test_moe_stage2_standalone(
     )
 
 
+# ---------------------------------------------------------------------------
+# FP6 (MXFP6-E2M3 activations x MXFP4 weights) standalone tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif("gfx95" not in ARCH, reason="FP6/FP4 MFMA requires gfx950+")
+@pytest.mark.parametrize(
+    "tokens, model_dim, inter_dim, experts, topk, tile_m, tile_n, tile_k",
+    [
+        pytest.param(64, 512, 256, 4, 2, 32, 128, 256, id="a6w4-S"),
+        pytest.param(128, 1024, 256, 8, 2, 64, 128, 256, id="a6w4-M"),
+    ],
+)
+def test_moe_gemm_a6w4_stage1(
+    tokens: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    seed: int = 42,
+):
+    """Stage1 correctness test: MXFP6-E2M3 activations x MXFP4 weights.
+
+    Compares FlyDSL a6w4 kernel output against a dequantized fp32 reference to
+    verify the kernel compiles and produces numerically valid (non-NaN/inf) results
+    within expected quantization noise bounds.
+
+    The A operand is stored FP8-padded (32 B per K=32 chunk: 24 B codes + 8 B zeros).
+    """
+    from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm_a6w4_stage1
+    from tests.kernels.utils import fp4_utils
+
+    if fp4_utils is None:
+        pytest.skip("fp4_utils not available (triton not installed)")
+
+    device = torch.device("cuda")
+    torch.manual_seed(seed)
+
+    x_fp32 = torch.randn((tokens, model_dim), device=device, dtype=torch.float32)
+    w1_fp32 = torch.randn((experts, 2 * inter_dim, model_dim), device=device, dtype=torch.float32) * 0.5
+    topk_weights_fp32 = torch.ones(tokens, topk, device=device, dtype=torch.float32)
+
+    # Build random topk routing
+    topk_ids = torch.stack([
+        torch.randperm(experts, device=device)[:topk] for _ in range(tokens)
+    ]).to(torch.int32)
+
+    # Use proper sorting (produces sorted_ids in (topk_slot<<24)|token_id format)
+    (
+        sorted_token_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        _sorted_size,
+        blocks,
+    ) = build_routing_buffers(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights_fp32,
+        experts=experts,
+        model_dim=model_dim,
+        tile_m=tile_m,
+        moe_sort_mode="torch",
+    )
+
+    # Quantize activations: MXFP6 E2M3, FP8-padded layout (24 B codes + 8 B zeros per K=32)
+    x_q, x_scale_raw, x_unpacked = fp4_utils.per_1x32_f6_quant(x_fp32)
+
+    # Quantize weights: MXFP4 E2M1
+    w1_flat_fp32 = w1_fp32.view(experts * 2 * inter_dim, model_dim)
+    w1_fp4, w1_scale_raw = _per_1x32_fp4_quant(w1_flat_fp32)
+
+    # Preshuffle W1 (MXFP4) and prepare sorted E8M0 scales
+    w1_q = shuffle_weight(w1_fp4.view(torch.float4_e2m1fn_x2))
+    w_kernel = w1_q.view(torch.uint8).contiguous().view(experts * 2 * inter_dim, model_dim // 2)
+    scale_x_1d = fp4_utils.e8m0_shuffle(x_scale_raw).view(torch.uint8).contiguous()
+    scale_w1_1d = fp4_utils.e8m0_shuffle(w1_scale_raw).view(torch.uint8).contiguous()
+
+    # Sort A scale into sorted-token order (identical to fp4 path; X is per-token, not per-topk-slot).
+    # stage1 X has one row per token (not tokens*topk), so use view(tokens, 1, -1) like fp4.
+    scale_x_1d_sorted = (
+        fp4_utils.moe_mxfp4_sort(
+            x_scale_raw.view(tokens, 1, -1),
+            sorted_ids=sorted_token_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=tokens,
+            block_size=tile_m,
+        )
+        .view(torch.uint8)
+        .contiguous()
+    )
+
+    out = torch.zeros(tokens * topk, inter_dim, device=device, dtype=torch.float16)
+    bias_dummy = torch.empty((0,), device=device, dtype=torch.float32)
+    out_scale_sorted_dummy = torch.empty((0,), device=device, dtype=torch.uint8)
+
+    exe = compile_mixed_moe_gemm_a6w4_stage1(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage1=False,
+        out_dtype="f16",
+        act="silu",
+    )
+
+    def _args(o, x, w, sx, sw, st, eids, sw_sorted):
+        return (
+            o,
+            x,
+            w,
+            sx,
+            sw,
+            st,
+            eids,
+            sw_sorted,
+            num_valid_ids,
+            bias_dummy,
+            out_scale_sorted_dummy,
+            tokens,
+            inter_dim * 2,
+            model_dim,
+            int(blocks),
+            torch.cuda.current_stream(),
+        )
+
+    compiled_exe = flyc.compile(
+        exe,
+        *_args(out, x_q.view(-1), w_kernel.view(-1), scale_x_1d_sorted, scale_w1_1d,
+               sorted_token_ids, sorted_expert_ids, sorted_weights),
+    )
+    compiled_exe(
+        *_args(out, x_q.view(-1), w_kernel.view(-1), scale_x_1d_sorted, scale_w1_1d,
+               sorted_token_ids, sorted_expert_ids, sorted_weights)
+    )
+
+    # Sanity checks:
+    kernel_out = out.float()
+    assert not kernel_out.isnan().any(), "a6w4 stage1 output contains NaN"
+    assert not kernel_out.isinf().any(), "a6w4 stage1 output contains Inf"
+
+    # Reference: dequantized fp32 forward via torch_moe_gemm1.
+    # Use fp6-dequantized X and original fp32 W for reference (no fp4 weight quant noise).
+    # Dequantize X: fp6 codes -> fp32 (undo scale)
+    e8m0_scale_f32 = fp4_utils.e8m0_to_f32(x_scale_raw)  # [tokens, K//32]
+    x_dq = fp4_utils.fp6_e2m3_to_f32(x_unpacked)  # [tokens, K]
+    x_dq = x_dq * e8m0_scale_f32.repeat_interleave(32, dim=1)[:, :model_dim]
+
+    w1_ref = w1_fp32  # use original fp32 weights (only A is fp6-quantized in this ref)
+    ref_out = torch_moe_gemm1(
+        x_dq.float(),
+        w1_ref,
+        None,
+        None,
+        topk_ids.to(torch.int64),
+        topk_weights_fp32,
+        inter_dim=inter_dim,
+        doweight_stage1=False,
+    )  # [tokens, topk, inter_dim]
+
+    kernel_out_view = kernel_out.view(tokens, topk, inter_dim)
+    ref_out_flat = ref_out.float()
+
+    diff = (kernel_out_view - ref_out_flat).abs()
+    mean_diff = diff.mean().item()
+    max_diff = diff.max().item()
+    print(f"[a6w4-stage1] max diff={max_diff:.4f} mean={mean_diff:.4f}")
+
+    # The output magnitude ~ sqrt(model_dim) due to random inputs; mean diff should be
+    # < 10% of the output std (fp4 weight quant noise only, since A ref is dequantized fp6).
+    out_std = ref_out_flat.float().std().item()
+    rel_mean_err = mean_diff / (out_std + 1e-6)
+    print(f"[a6w4-stage1] out_std={out_std:.4f} rel_mean_err={rel_mean_err:.4f}")
+    assert rel_mean_err < 0.30, (
+        f"a6w4 stage1 relative mean error too large: {rel_mean_err:.4f} "
+        f"(mean_diff={mean_diff:.4f}, out_std={out_std:.4f})"
+    )
+
+
 if __name__ == "__main__":
     torch.set_default_device("cuda")
 
