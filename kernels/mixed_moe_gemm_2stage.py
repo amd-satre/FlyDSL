@@ -247,7 +247,11 @@ def compile_mixed_moe_gemm1(
 
     _need_fp4 = out_dtype == "fp4"
     _need_fp8 = out_dtype == "fp8"
-    _need_quant = _need_fp4 or _need_fp8
+    # fp6-E2M3 fused epilogue: moe1 writes fp6 codes + E8M0 scales directly,
+    # eliminating the separate _quant_act_fp6(out1, ...) pass (~17% of decode).
+    # headroom=2 (floor(log2(7.5))=2, same as fp4 since both round to exp-2).
+    _need_fp6 = out_dtype in ("fp6", "fp6_e2m3")
+    _need_quant = _need_fp4 or _need_fp8 or _need_fp6
     _need_sort = _need_quant
 
     if _need_quant:
@@ -255,6 +259,7 @@ def compile_mixed_moe_gemm1(
 
     _fp4q_tag = "_fp4q" if _need_fp4 else ""
     _fp8q_tag = "_fp8q" if _need_fp8 else ""
+    _fp6q_tag = "_fp6q" if _need_fp6 else ""
     _sort_tag = "_sort" if _need_sort else ""
     _async_tag = "_async" if use_async_copy else ""
     _sk_tag = f"_sk{k_batch}" if _is_splitk else ""
@@ -264,7 +269,7 @@ def compile_mixed_moe_gemm1(
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}_v32"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_fp6q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}_v32"
     ).replace("-", "_")
 
     # -- LDS sizing --
@@ -1919,7 +1924,7 @@ def compile_mixed_moe_gemm1(
                 _out_row_stride = (
                     inter_dim * 2 * out_elem_bytes
                     if _is_splitk
-                    else (inter_dim // 2 if _need_fp4 else (inter_dim if _need_fp8 else inter_dim * out_elem_bytes))
+                    else (inter_dim // 2 if _need_fp4 else (inter_dim if (_need_fp8 or _need_fp6) else inter_dim * out_elem_bytes))
                 )
 
                 def precompute_row(*, row_local, row):
@@ -1977,8 +1982,15 @@ def compile_mixed_moe_gemm1(
                 _c0_f32 = arith.constant(0.0, type=T.f32)
 
                 _c8_i32 = arith.constant(8, type=T.i32)
-                _fp_headroom = 2 if _need_fp4 else (8 if _need_fp8 else 0)
+                # fp6-E2M3 headroom = floor(log2(7.5)) = 2 (same as fp4, same formula)
+                _fp_headroom = 2 if (_need_fp4 or _need_fp6) else (8 if _need_fp8 else 0)
                 _c_headroom_i32 = arith.constant(_fp_headroom, type=T.i32)
+                # fp6 scale store: simple row-major layout (ts_idx * K_blocks + k_block)
+                _c0xFF_i32 = arith.constant(0xFF, type=T.i32)
+                _c24_i32 = arith.constant(24, type=T.i32)
+                _c_mask24_i32 = arith.constant(0xFFFFFF, type=T.i32)
+                _c_topk_i32 = arith.constant(topk, type=T.i32)
+                _c_kblk_per_row_i32 = arith.constant(inter_dim // 32, type=T.i32)
 
                 def _f32_to_e2m1(qx_f32):
                     """Convert a scaled f32 value to fp4 (e2m1) 4-bit integer."""
@@ -2125,29 +2137,110 @@ def compile_mixed_moe_gemm1(
                                         nontemporal=True,
                                     )
 
+                        elif const_expr(_need_fp6):
+                            # fp6-E2M3: each element → 6-bit code stored in 1 uint8.
+                            # Use _f32_to_e2m3 (ported from quant_act_a6_flydsl.py).
+                            def _f32_to_e2m3_local(qx_f32):
+                                """f32 → fp6-E2M3 code in low 6 bits of i32.
+                                E2M3: 1 sign + 2 exp + 3 mant, max=7.5, bias=1."""
+                                qx = qx_f32.bitcast(T.i32)
+                                s = qx & _c0x80000000_i32
+                                e = (qx >> _c23_i32) & _c0xFF_i32
+                                m = qx & _c0x7FFFFFFF_i32
+                                c126 = arith.constant(126, type=T.i32)
+                                adj_exp = arith.maxsi(c126 - e, _c0_i32)
+                                m_denorm = (arith.constant(0x400000, type=T.i32) | (m >> _c1_i32)) >> adj_exp
+                                c127 = arith.constant(127, type=T.i32)
+                                m_pick = (e < c127).select(m_denorm, m)
+                                e_norm = arith.maxsi(e - c126, _c0_i32)
+                                c19 = arith.constant(19, type=T.i32)
+                                v4 = (e_norm << arith.constant(4, type=T.i32)) | (m_pick >> c19)
+                                kept = v4 >> _c1_i32
+                                rbit = v4 & _c1_i32
+                                sticky = arith.cmpi(
+                                    arith.CmpIPredicate.ne,
+                                    m_pick & arith.constant(0x7FFFF, type=T.i32),
+                                    _c0_i32,
+                                ).select(_c1_i32, _c0_i32)
+                                lsb = kept & _c1_i32
+                                round_up = rbit & (sticky | lsb)
+                                rounded = kept + round_up
+                                c31 = arith.constant(31, type=T.i32)
+                                e2m3 = arith.minui(rounded, c31)
+                                return (s >> arith.constant(26, type=T.i32)) | e2m3
+
+                            fp6_vals = []
+                            for i in range_constexpr(_e_vec):
+                                fp6_vals.append(_f32_to_e2m3_local(frag_vals[i] * quant_scale))
+
+                            # Store _e_vec uint8 codes; pack 4 per i32 word, handle tail.
+                            ptr_addr_idx = row_byte_base + col_g0
+                            for _wg in range_constexpr(_e_vec // 4):
+                                _b = _wg * 4
+                                packed_w = fp6_vals[_b]
+                                packed_w = packed_w | (fp6_vals[_b + 1] << _c8_i32)
+                                packed_w = packed_w | (fp6_vals[_b + 2] << arith.constant(16, type=T.i32))
+                                packed_w = packed_w | (fp6_vals[_b + 3] << arith.constant(24, type=T.i32))
+                                word_ptr = ptr_addr_idx + arith.constant(_wg * 4, index=True)
+                                out_ptr_v = _idx_to_llvm_ptr(word_ptr)
+                                packed_raw = packed_w._value if hasattr(packed_w, "_value") else packed_w
+                                llvm.StoreOp(packed_raw, out_ptr_v, alignment=4, nontemporal=True)
+                            # Remainder bytes (when _e_vec % 4 != 0)
+                            _rem_base = (_e_vec // 4) * 4
+                            if const_expr(_e_vec % 4 >= 2):
+                                packed_h = fp6_vals[_rem_base] | (fp6_vals[_rem_base + 1] << _c8_i32)
+                                h_ptr = ptr_addr_idx + arith.constant(_rem_base, index=True)
+                                out_ptr_v = _idx_to_llvm_ptr(h_ptr)
+                                packed_h16 = arith.TruncIOp(T.i16, packed_h)
+                                packed_raw = packed_h16._value if hasattr(packed_h16, "_value") else packed_h16
+                                llvm.StoreOp(packed_raw, out_ptr_v, alignment=2, nontemporal=True)
+                            if const_expr(_e_vec % 2 == 1):
+                                last_idx = _e_vec - 1
+                                b_ptr = ptr_addr_idx + arith.constant(last_idx, index=True)
+                                out_ptr_v = _idx_to_llvm_ptr(b_ptr)
+                                packed_b = arith.TruncIOp(T.i8, fp6_vals[last_idx])
+                                packed_raw = packed_b._value if hasattr(packed_b, "_value") else packed_b
+                                llvm.StoreOp(packed_raw, out_ptr_v, alignment=1, nontemporal=True)
+
                         if const_expr(_need_sort):
                             col_g0_i32 = arith.index_cast(T.i32, col_g0)
                             is_scale_writer = arith.cmpi(CmpIPredicate.eq, col_g0_i32 & _c31_i32, _c0_i32)
                             _if_scale = scf.IfOp(is_scale_writer)
                             with ir.InsertionPoint(_if_scale.then_block):
-                                row_i32_s = arith.index_cast(T.i32, row)
-                                col_s_i32 = col_g0_i32 >> _c5_i32
-                                d0 = row_i32_s >> _c5_i32
-                                d1 = (row_i32_s >> _c4_i32) & _c1_i32
-                                d2 = row_i32_s & _c15_i32
-                                d3 = col_s_i32 >> _c3_i32
-                                d4 = (col_s_i32 >> _c2_i32) & _c1_i32
-                                d5 = col_s_i32 & _c3_i32
-                                byte_off = (
-                                    d0 * _n32_sort + d3 * _c256_i32 + d5 * _c64_i32 + d2 * _c4_i32 + d4 * _c2_i32 + d1
-                                )
-                                e8m0_i8 = arith.TruncIOp(T.i8, e8m0_biased)
-                                buffer_ops.buffer_store(
-                                    e8m0_i8,
-                                    sorted_scale_rsrc,
-                                    byte_off,
-                                    offset_is_bytes=True,
-                                )
+                                if const_expr(_need_fp6):
+                                    # fp6 scale: simple row-major layout ts_idx*(K//32) + k_block.
+                                    # fused = t | (s << 24) where t=token idx, s=topk slot.
+                                    t_i32 = fused & _c_mask24_i32
+                                    s_i32 = fused >> _c24_i32
+                                    ts_idx_i32 = t_i32 * _c_topk_i32 + s_i32
+                                    k_block_i32 = col_g0_i32 >> _c5_i32
+                                    scale_byte_off = ts_idx_i32 * _c_kblk_per_row_i32 + k_block_i32
+                                    e8m0_i8 = arith.TruncIOp(T.i8, e8m0_biased)
+                                    buffer_ops.buffer_store(
+                                        e8m0_i8,
+                                        sorted_scale_rsrc,
+                                        scale_byte_off,
+                                        offset_is_bytes=True,
+                                    )
+                                else:
+                                    row_i32_s = arith.index_cast(T.i32, row)
+                                    col_s_i32 = col_g0_i32 >> _c5_i32
+                                    d0 = row_i32_s >> _c5_i32
+                                    d1 = (row_i32_s >> _c4_i32) & _c1_i32
+                                    d2 = row_i32_s & _c15_i32
+                                    d3 = col_s_i32 >> _c3_i32
+                                    d4 = (col_s_i32 >> _c2_i32) & _c1_i32
+                                    d5 = col_s_i32 & _c3_i32
+                                    byte_off = (
+                                        d0 * _n32_sort + d3 * _c256_i32 + d5 * _c64_i32 + d2 * _c4_i32 + d4 * _c2_i32 + d1
+                                    )
+                                    e8m0_i8 = arith.TruncIOp(T.i8, e8m0_biased)
+                                    buffer_ops.buffer_store(
+                                        e8m0_i8,
+                                        sorted_scale_rsrc,
+                                        byte_off,
+                                        offset_is_bytes=True,
+                                    )
                                 scf.YieldOp([])
                     elif const_expr(_is_splitk):
                         col_idx = col_g0 + arith.constant(_sk_n_offset[0], index=True)
