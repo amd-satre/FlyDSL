@@ -272,9 +272,20 @@ Type IntTupleBuilder<IntTupleValueAdaptor>::getCommonIntType(IntTupleAttr lhs,
                                                               : builder.getI32Type();
 }
 Value IntTupleBuilder<IntTupleValueAdaptor>::extendToIntType(Value input, Type intType) const {
-  if (input.getType() != intType) {
-    input = arith::ExtSIOp::create(builder, loc, intType, input);
+  if (input.getType() == intType)
+    return input;
+  // index type: use IndexCastOp (valid for index ↔ any integer type).
+  if (isa<IndexType>(input.getType())) {
+    input = arith::IndexCastOp::create(builder, loc, intType, input).getResult();
+    return input;
   }
+  // Integer → integer: use ExtSIOp (widen) or TruncIOp (narrow).
+  auto srcWidth = cast<IntegerType>(input.getType()).getWidth();
+  auto dstWidth = cast<IntegerType>(intType).getWidth();
+  if (srcWidth < dstWidth)
+    input = arith::ExtSIOp::create(builder, loc, intType, input).getResult();
+  else
+    input = arith::TruncIOp::create(builder, loc, intType, input).getResult();
   return input;
 }
 
