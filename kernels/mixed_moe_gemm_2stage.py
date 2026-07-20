@@ -121,6 +121,7 @@ def compile_mixed_moe_gemm1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    dense_a_fp6: bool = False,
 ):
     """Compile stage1 kernel (gate+up with silu/swiglu).
 
@@ -585,9 +586,13 @@ def compile_mixed_moe_gemm1(
             c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
 
             # X: [tokens, model_dim]
-            x_nbytes_idx = (tokens_in * k_in * c_elem_bytes) / c_a_pack
-            x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
-            x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=False, num_records_bytes=x_nbytes_i32)
+            if is_f6_a and dense_a_fp6:
+                # Dense fp6: K*3/4 bytes per row (no zero-pad). Use max_size.
+                x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=True)
+            else:
+                x_nbytes_idx = (tokens_in * k_in * c_elem_bytes) / c_a_pack
+                x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
+                x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=False, num_records_bytes=x_nbytes_i32)
 
             w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
 
@@ -1021,6 +1026,114 @@ def compile_mixed_moe_gemm1(
 
                     def prefetch_x_to_lds(base_k, lds_buffer):
                         dma_x_tile_to_lds(base_k, lds_buffer)
+
+                # ── Dense fp6 A-load for stage-1 (gate+up): 24B/block from HBM ─────────
+                # Stage-1: X row = token_id only (no topk slot).
+                # Overrides load_x_tile / store_x_tile_to_lds (non-async path) and
+                # prefetch_x_to_lds (async path) with a block-based dense loader.
+                if is_f6_a and dense_a_fp6:
+                    _d1_k_blks = tile_k // 32
+                    _d1_total_blks = tile_m * _d1_k_blks
+                    _d1_partial = _d1_total_blks <= total_threads
+                    _d1_blks_per_thread = 0 if _d1_partial else _d1_total_blks // total_threads
+                    # Dense HBM row size: model_dim * 3 // 8 dwordx2 units
+                    _d1_row_dwordx2 = model_dim * 3 // 8
+                    _d1_layout = fx.make_layout((tile_m, _d1_k_blks), (_d1_k_blks, 1))
+                    _d1_vec1_i64 = T.vec(1, T.i64)
+                    _d1_vec2_i64 = T.vec(2, T.i64)
+                    _d1_vec4_i32 = T.vec(4, T.i32)
+
+                    def _dense_s1_load_expand_store(blk_linear, base_k_v, lds_buffer):
+                        """Load one K=32 dense block per thread (stage-1 routing), expand, write LDS."""
+                        crd = idx2crd(blk_linear, _d1_layout)
+                        blk_row = layout_get(crd, 0)
+                        blk_k = layout_get(crd, 1)
+
+                        # Token routing: stage-1 uses token_id only (no topk slot)
+                        sorted_row_i = bx_m + blk_row
+                        fused_i = buffer_ops.buffer_load(sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32)
+                        t_i32 = arith.andi(fused_i, arith.constant(0xFFFFFF))
+                        _tok_i32 = arith.index_cast(T.i32, tokens_in)
+                        _topk_i32_s1 = arith.constant(topk, type=T.i32)
+                        s_i32 = arith.shrui(fused_i, arith.constant(24))
+                        t_valid = arith.cmpi(CmpIPredicate.ult, t_i32, _tok_i32)
+                        s_valid = arith.cmpi(CmpIPredicate.ult, s_i32, _topk_i32_s1)
+                        ts_valid = arith.andi(t_valid, s_valid)
+                        t_safe = arith.select(ts_valid, t_i32, arith.constant(0, type=T.i32))
+
+                        # Dense HBM offset: t_safe * _d1_row_dwordx2 + kblk * 3  (dwordx2 units)
+                        row_dw2_i32 = arith.muli(t_safe, arith.constant(_d1_row_dwordx2, type=T.i32))
+                        base_k_blk_i32 = arith.shrui(
+                            arith.index_cast(T.i32, base_k_v), arith.constant(5, type=T.i32)
+                        )
+                        blk_k_i32 = arith.index_cast(T.i32, blk_k)
+                        kblk_off_i32 = arith.muli(
+                            arith.addi(base_k_blk_i32, blk_k_i32), arith.constant(3, type=T.i32)
+                        )
+                        dw2_base = arith.addi(row_dw2_i32, kblk_off_i32)
+
+                        # 3 × dwordx2 (8B) loads
+                        d0 = buffer_ops.buffer_load(x_rsrc, dw2_base, vec_width=2, dtype=T.i32)
+                        d1 = buffer_ops.buffer_load(
+                            x_rsrc, arith.addi(dw2_base, arith.constant(2, type=T.i32)), vec_width=2, dtype=T.i32
+                        )
+                        d2 = buffer_ops.buffer_load(
+                            x_rsrc, arith.addi(dw2_base, arith.constant(4, type=T.i32)), vec_width=2, dtype=T.i32
+                        )
+                        rocdl.s_waitcnt(0)  # wait for VMEM before LDS stores
+
+                        c0 = arith.constant(0, type=T.i64)
+                        i0 = vector.extract(
+                            vector.bitcast(_d1_vec1_i64, d0), static_position=[0], dynamic_position=[]
+                        )
+                        i1 = vector.extract(
+                            vector.bitcast(_d1_vec1_i64, d1), static_position=[0], dynamic_position=[]
+                        )
+                        i2 = vector.extract(
+                            vector.bitcast(_d1_vec1_i64, d2), static_position=[0], dynamic_position=[]
+                        )
+                        v0 = vector.bitcast(_d1_vec4_i32, vector.from_elements(_d1_vec2_i64, [i0, i1]))
+                        v1 = vector.bitcast(_d1_vec4_i32, vector.from_elements(_d1_vec2_i64, [i2, c0]))
+
+                        # Bug 2 fix: col offsets in i32; convert to index for type-safe swizzle/store.
+                        blk_k_i32_lds = arith.index_cast(T.i32, blk_k)
+                        col0_dw = arith.muli(blk_k_i32_lds, arith.constant(8, type=T.i32))
+                        col1_dw = arith.addi(col0_dw, arith.constant(4, type=T.i32))
+                        _col0_b = arith.index_cast(ir.IndexType.get(), col0_dw) * arith.index(4)
+                        _col1_b = arith.index_cast(ir.IndexType.get(), col1_dw) * arith.index(4)
+                        _swz0 = swizzle_xor16(blk_row, _col0_b, k_blocks16)
+                        _swz1 = swizzle_xor16(blk_row, _col1_b, k_blocks16)
+                        _lds_row_stride = arith.constant(_eff_lds_stride, index=True)
+                        _ldsidx0 = blk_row * _lds_row_stride + _swz0 + _lds_base_zero
+                        _ldsidx1 = blk_row * _lds_row_stride + _swz1 + _lds_base_zero
+                        vector.store(vector.bitcast(vec16_x, v0), lds_buffer, [_ldsidx0])
+                        vector.store(vector.bitcast(vec16_x, v1), lds_buffer, [_ldsidx1])
+
+                    def _dense_s1_prefetch(base_k, lds_buffer):
+                        if _d1_partial:
+                            _is_active = arith.cmpi(
+                                CmpIPredicate.ult, tx, arith.constant(_d1_total_blks, index=True)
+                            )
+                            _if_act = scf.IfOp(_is_active)
+                            with ir.InsertionPoint(_if_act.then_block):
+                                _dense_s1_load_expand_store(tx, base_k, lds_buffer)
+                                scf.YieldOp([])
+                        else:
+                            for _bi in range_constexpr(_d1_blks_per_thread):
+                                _dense_s1_load_expand_store(
+                                    tx + arith.index(_bi * total_threads), base_k, lds_buffer
+                                )
+
+                    # Override the load + store pair (non-async path) and prefetch (async path)
+                    def load_x_tile(base_k):  # noqa: F811
+                        return (base_k,)  # sentinel: carry base_k through to store
+
+                    def store_x_tile_to_lds(sentinel, lds_buffer):  # noqa: F811
+                        _dense_s1_prefetch(sentinel[0], lds_buffer)
+
+                    if const_expr(use_async_copy):
+                        def prefetch_x_to_lds(base_k, lds_buffer):  # noqa: F811
+                            _dense_s1_prefetch(base_k, lds_buffer)
 
                 def lds_load_packs_k64(curr_row_a_lds, col_base, lds_buffer):
                     col_base_swz_bytes = swizzle_xor16(curr_row_a_lds, col_base, k_blocks16)
@@ -2552,6 +2665,7 @@ def compile_mixed_moe_gemm2(
     sort_block_m: int = 0,
     b_nt: int = 2,
     xcd_swizzle: int = 0,
+    dense_a_fp6: bool = False,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -2750,10 +2864,11 @@ def compile_mixed_moe_gemm2(
     _sbm_tag = "" if _sort_block_m == tile_m else f"_sbm{_sort_block_m}"
     _pm_tag = f"_persist_cu{_cu_num}" if _persistent else f"_pm{persist_m}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    _dense_tag = "_dense" if (is_f6_a and dense_a_fp6) else ""
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_vscale_fix3{_pm_tag}{_sbm_tag}{_xcd_tag}"
+        f"_vscale_fix3{_pm_tag}{_sbm_tag}{_xcd_tag}{_dense_tag}"
     ).replace("-", "_")
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Ping-pong A2 tiles via separate allocators (like stage1).
@@ -2905,10 +3020,15 @@ def compile_mixed_moe_gemm2(
             # X(A2): buffer size in bytes, accounting for FP4 packing (2 elements per byte).
             # fp8/int8: 1 byte per element  -> bytes = tokens*topk * K
             # fp4:      2 elements per byte -> bytes = tokens*topk * K / 2
+            # fp6 dense: 3/4 byte per element -> bytes = tokens*topk * K * 3 / 4
             c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
-            x_nbytes_idx = _div_pow2((tokens_in * c_topk) * k_in * c_elem_bytes, int(a_elem_vec_pack))
-            x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
-            x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=False, num_records_bytes=x_nbytes_i32)
+            if is_f6_a and dense_a_fp6:
+                # Dense fp6: K*3/4 bytes per row (no zero-pad). Use max_size to avoid descriptor overflow.
+                x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=True)
+            else:
+                x_nbytes_idx = _div_pow2((tokens_in * c_topk) * k_in * c_elem_bytes, int(a_elem_vec_pack))
+                x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
+                x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=False, num_records_bytes=x_nbytes_i32)
 
             w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
 
@@ -3646,6 +3766,106 @@ def compile_mixed_moe_gemm2(
                 def prefetch_x_to_lds(base_k, lds_buffer):
                     dma_x_tile_to_lds(base_k, lds_buffer)
 
+                # ── Dense fp6 A-load: 24B/block from HBM, expand to padded 32B in LDS ─────
+                # Mirrors standalone preshuffle_gemm_a6w4.py dense path, but decodes token
+                # routing (t*topk+s) per K=32 block rather than per 16B load chunk.
+                # LDS layout is unchanged (padded 32B/block); only the HBM→reg→LDS path
+                # changes.  DMA path above is replaced when dense_a_fp6=True.
+                if is_f6_a and dense_a_fp6:
+                    _d_k_blks = tile_k // 32           # K=32 blocks per tile-K column
+                    _d_total_blks = tile_m * _d_k_blks  # total blocks per A tile
+                    _d_partial = _d_total_blks <= total_threads
+                    _d_blks_per_thread = 0 if _d_partial else _d_total_blks // total_threads
+                    # Dense HBM row size: inter_dim * 3 // 4 bytes = inter_dim * 3 // 8 dwordx2 units
+                    _d_row_dwordx2 = inter_dim * 3 // 8
+                    _d_layout = fx.make_layout((tile_m, _d_k_blks), (_d_k_blks, 1))
+                    _d_vec1_i64 = T.vec(1, T.i64)
+                    _d_vec2_i64 = T.vec(2, T.i64)
+                    _d_vec4_i32 = T.vec(4, T.i32)
+
+                    def _dense_s2_load_expand_store(blk_linear, base_k_v, lds_buffer):
+                        """Load one K=32 dense block per thread, expand, write to padded LDS."""
+                        crd = idx2crd(blk_linear, _d_layout)
+                        blk_row = layout_get(crd, 0)
+                        blk_k = layout_get(crd, 1)
+
+                        # Token routing: stage-2 uses t*topk + s
+                        sorted_row_i = bx_m + blk_row
+                        fused_i = buffer_ops.buffer_load(sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32)
+                        t_i32 = arith.andi(fused_i, arith.constant(0xFFFFFF))
+                        s_i32 = arith.shrui(fused_i, arith.constant(24))
+                        _tok_i32 = arith.index_cast(T.i32, tokens_in)
+                        _topk_i32 = arith.constant(topk, type=T.i32)
+                        t_valid = arith.cmpi(CmpIPredicate.ult, t_i32, _tok_i32)
+                        s_valid = arith.cmpi(CmpIPredicate.ult, s_i32, _topk_i32)
+                        ts_valid = arith.andi(t_valid, s_valid)
+                        t_safe = arith.select(ts_valid, t_i32, arith.constant(0, type=T.i32))
+                        s_safe = arith.select(ts_valid, s_i32, arith.constant(0, type=T.i32))
+
+                        # Dense HBM offset: (t*topk+s)*_d_row_dwordx2 + kblk*3  (dwordx2 units)
+                        row_ts_i32 = arith.addi(arith.muli(t_safe, _topk_i32), s_safe)
+                        row_dw2_i32 = arith.muli(row_ts_i32, arith.constant(_d_row_dwordx2, type=T.i32))
+                        base_k_blk_i32 = arith.shrui(arith.index_cast(T.i32, base_k_v), arith.constant(5, type=T.i32))
+                        blk_k_i32 = arith.index_cast(T.i32, blk_k)
+                        kblk_off_i32 = arith.muli(
+                            arith.addi(base_k_blk_i32, blk_k_i32), arith.constant(3, type=T.i32)
+                        )
+                        dw2_base = arith.addi(row_dw2_i32, kblk_off_i32)
+
+                        # 3 × dwordx2 (8B) loads — 24B real data per K=32 block
+                        d0 = buffer_ops.buffer_load(x_rsrc, dw2_base, vec_width=2, dtype=T.i32)
+                        d1 = buffer_ops.buffer_load(
+                            x_rsrc, arith.addi(dw2_base, arith.constant(2, type=T.i32)), vec_width=2, dtype=T.i32
+                        )
+                        d2 = buffer_ops.buffer_load(
+                            x_rsrc, arith.addi(dw2_base, arith.constant(4, type=T.i32)), vec_width=2, dtype=T.i32
+                        )
+                        # Wait for VMEM loads before LDS stores
+                        rocdl.s_waitcnt(0)
+
+                        # Expand 3×8B → 2×16B: v0=[d0|d1], v1=[d2|zeros]
+                        c0 = arith.constant(0, type=T.i64)
+                        i0 = vector.extract(vector.bitcast(_d_vec1_i64, d0), static_position=[0], dynamic_position=[])
+                        i1 = vector.extract(vector.bitcast(_d_vec1_i64, d1), static_position=[0], dynamic_position=[])
+                        i2 = vector.extract(vector.bitcast(_d_vec1_i64, d2), static_position=[0], dynamic_position=[])
+                        v0 = vector.bitcast(_d_vec4_i32, vector.from_elements(_d_vec2_i64, [i0, i1]))
+                        v1 = vector.bitcast(_d_vec4_i32, vector.from_elements(_d_vec2_i64, [i2, c0]))
+
+                        # Bug 2 fix: col offsets in i32 to avoid ArithValue index/i32 confusion.
+                        # Compute in i32, convert to index for swizzle, then direct vector.store.
+                        blk_k_i32_lds = arith.index_cast(T.i32, blk_k)
+                        col0_dw = arith.muli(blk_k_i32_lds, arith.constant(8, type=T.i32))
+                        col1_dw = arith.addi(col0_dw, arith.constant(4, type=T.i32))
+                        # Convert to byte offsets (index) for type-safe swizzle and LDS addressing
+                        _col0_b = arith.index_cast(ir.IndexType.get(), col0_dw) * arith.index(4)
+                        _col1_b = arith.index_cast(ir.IndexType.get(), col1_dw) * arith.index(4)
+                        _swz0 = swizzle_xor16(blk_row, _col0_b, k_blocks16)
+                        _swz1 = swizzle_xor16(blk_row, _col1_b, k_blocks16)
+                        _lds_row_stride = arith.constant(_eff_lds_stride, index=True)
+                        _ldsidx0 = blk_row * _lds_row_stride + _swz0 + _lds_base_zero
+                        _ldsidx1 = blk_row * _lds_row_stride + _swz1 + _lds_base_zero
+                        vector.store(vector.bitcast(vec16_x, v0), lds_buffer, [_ldsidx0])
+                        vector.store(vector.bitcast(vec16_x, v1), lds_buffer, [_ldsidx1])
+
+                    if _d_partial:
+                        # Partial mode: threads [0, _d_total_blks) each load 1 block.
+                        # Inactive threads skip with a runtime branch.
+                        def prefetch_x_to_lds(base_k, lds_buffer):  # noqa: F811
+                            _is_active = arith.cmpi(
+                                CmpIPredicate.ult, tx, arith.constant(_d_total_blks, index=True)
+                            )
+                            _if_act = scf.IfOp(_is_active)
+                            with ir.InsertionPoint(_if_act.then_block):
+                                _dense_s2_load_expand_store(tx, base_k, lds_buffer)
+                                scf.YieldOp([])
+                    else:
+                        # Full mode: each thread loads _d_blks_per_thread blocks.
+                        def prefetch_x_to_lds(base_k, lds_buffer):  # noqa: F811
+                            for _bi in range_constexpr(_d_blks_per_thread):
+                                _dense_s2_load_expand_store(
+                                    tx + arith.index(_bi * total_threads), base_k, lds_buffer
+                                )
+
                 rocdl.sched_barrier(0)
 
                 def hot_loop_scheduler():
@@ -4065,6 +4285,7 @@ def compile_mixed_moe_gemm2(
         _sort_block_m,
         _cu_num if _persistent else 0,
         xcd_swizzle,
+        dense_a_fp6,
     )
 
     @flyc.jit
@@ -4131,23 +4352,27 @@ def compile_mixed_moe_gemm2(
     return launch_mixed_moe_gemm2
 
 
-def compile_mixed_moe_gemm_a6w4_stage1(**kwargs):
+def compile_mixed_moe_gemm_a6w4_stage1(*, dense_a_fp6: bool = False, **kwargs):
     """MXFP6-E2M3 activation x MXFP4 weight MoE stage1 (gate+up) GEMM.
 
     Thin wrapper setting a_dtype='fp6', b_dtype='fp4'.
+    Pass dense_a_fp6=True to load activations from dense 24B/K=32-block layout
+    instead of the padded 32B/K=32-block layout.
     """
     kwargs.setdefault("a_dtype", "fp6")
     kwargs.setdefault("b_dtype", "fp4")
     assert kwargs["a_dtype"] == "fp6" and kwargs["b_dtype"] == "fp4"
-    return compile_mixed_moe_gemm1(**kwargs)
+    return compile_mixed_moe_gemm1(**kwargs, dense_a_fp6=dense_a_fp6)
 
 
-def compile_mixed_moe_gemm_a6w4_stage2(**kwargs):
+def compile_mixed_moe_gemm_a6w4_stage2(*, dense_a_fp6: bool = False, **kwargs):
     """MXFP6-E2M3 activation x MXFP4 weight MoE stage2 (down) GEMM.
 
     Thin wrapper setting a_dtype='fp6', b_dtype='fp4'.
+    Pass dense_a_fp6=True to load activations from dense 24B/K=32-block layout
+    instead of the padded 32B/K=32-block layout.
     """
     kwargs.setdefault("a_dtype", "fp6")
     kwargs.setdefault("b_dtype", "fp4")
     assert kwargs["a_dtype"] == "fp6" and kwargs["b_dtype"] == "fp4"
-    return compile_mixed_moe_gemm2(**kwargs)
+    return compile_mixed_moe_gemm2(**kwargs, dense_a_fp6=dense_a_fp6)
