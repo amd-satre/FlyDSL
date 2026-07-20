@@ -3021,9 +3021,14 @@ def compile_mixed_moe_gemm2(
             # fp8/int8: 1 byte per element  -> bytes = tokens*topk * K
             # fp4:      2 elements per byte -> bytes = tokens*topk * K / 2
             # fp6 dense: 3/4 byte per element -> bytes = tokens*topk * K * 3 / 4
+            # x_rsrc: buffer resource for A (activation) matrix.
+            # For fp6 dense: use max_size=True (dense layout: K*3/4 bytes/row, not inferrable).
+            # For all other layouts: use explicit num_records_bytes for OOB safety.
+            # Use const_expr to avoid Python closure-capture issues with if/else assignments
+            # (regular Python if/else breaks closure for dma_x_tile_to_lds nested inside
+            # _moe_gemm2_then_body; const_expr dispatch is handled correctly by FlyDSL tracing).
             c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
-            if is_f6_a and dense_a_fp6:
-                # Dense fp6: K*3/4 bytes per row (no zero-pad). Use max_size to avoid descriptor overflow.
+            if const_expr(is_f6_a and dense_a_fp6):
                 x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=True)
             else:
                 x_nbytes_idx = _div_pow2((tokens_in * c_topk) * k_in * c_elem_bytes, int(a_elem_vec_pack))
