@@ -74,6 +74,7 @@ def _compile_mxfp_blockscale_gemm(
     use_async_copy: bool = True,
     dsrd_preload: int = -1,
     dvmem_preload: int = -1,
+    dense_fp6: bool = False,
 ):
     """Shared implementation for MXFP4 (a_dtype='fp4') and MXFP6 (a_dtype='fp6') preshuffle GEMM.
 
@@ -85,8 +86,25 @@ def _compile_mxfp_blockscale_gemm(
         raise ValueError(f"K must be a multiple of 256 (e8m0 scale chunk); got K={K}")
     out_elem = BFloat16 if out_dtype == "bf16" else Float16
 
+    # Validate dense_fp6 tile constraint
+    if dense_fp6 and a_dtype != "fp6":
+        raise ValueError("dense_fp6=True requires a_dtype='fp6'")
+    if dense_fp6:
+        _total_blocks = BM * BK // 32
+        _dense_full = _total_blocks >= 256 and _total_blocks % 256 == 0
+        _dense_partial = _total_blocks <= 256
+        if not (_dense_full or _dense_partial):
+            raise ValueError(
+                f"dense_fp6: tile_m*tile_k//32 must be ≤256 (partial) or divisible by 256 (full);"
+                f" got BM={BM} BK={BK} → {_total_blocks} blocks"
+            )
+
     # A dtype-specific row sizes
-    if a_dtype == "fp6":
+    if a_dtype == "fp6" and dense_fp6:
+        # Dense fp6: 24B per K=32 block (no zero-pad) → K*3/4 bytes per row
+        a_row_bytes = K * 3 // 4
+        A_ROW_B = BK  # LDS layout unchanged: 32B per K=32 block (padded)
+    elif a_dtype == "fp6":
         # FP8-padded fp6: 1 byte per code
         a_row_bytes = K
         A_ROW_B = BK
@@ -170,6 +188,9 @@ def _compile_mxfp_blockscale_gemm(
         # A: cooperative gmem->LDS then ds_read the MFMA operands. Bound to the actual
         # M rows so blocks past M read OOB -> 0 instead of faulting (ragged M).
         a_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
+        # Dense fp6: 64-bit (8B) buffer loads for block-scatter loading.
+        if const_expr(dense_fp6 and a_dtype == "fp6"):
+            a_copy_64b = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), 32)
         _i8g = fx.PointerType.get(T.i8, address_space=fx.AddressSpace.Global, alignment=16)
         a_nrec = fx.Int64(i32_m) * fx.Int64(a_row_bytes)
         a_flat = fx.rocdl.make_buffer_tensor(
@@ -207,6 +228,86 @@ def _compile_mxfp_blockscale_gemm(
                 reg = fx.make_rmem_tensor(4, Int32)
                 fx.copy_atom_call(a_copy, a_flat_div[None, gmem_byte], reg)
                 fx.copy(lds_copy, reg, _lds_view(base_iter, row * fx.Int32(A_ROW_I32) + col // fx.Int32(4)))
+
+        if const_expr(dense_fp6 and a_dtype == "fp6"):
+            # Dense fp6 A-load: 24B/block from HBM (K*3/4 bytes/row) → expand to 32B/block in LDS.
+            # LDS layout is unchanged (32B/block padded), so read_a and MFMA path are unmodified.
+            #
+            # Block mapping:
+            #   block_linear ∈ [0, BM * BK//32)
+            #   blk_row = block_linear // (BK//32)   ← M-row in [0, BM)
+            #   blk_k   = block_linear % (BK//32)    ← K=32 block in [0, BK//32)
+            # HBM byte: (bx_m + blk_row) * (K*3//4) + kt*(BK*3//4) + blk_k*24
+            # LDS i32:  blk_row * A_ROW_I32 + blk_k * 8  (8 i32 = 32B per block)
+            _D_KBLKS = BK // 32     # K=32 blocks per tile row
+            _D_ROW_B = K * 3 // 4  # dense HBM bytes per M-row
+
+            def _dense_one_block(base_k_dense, blk_row, blk_k, base_iter):
+                """Load one K=32 block (24B) from dense HBM → expand to 32B in LDS."""
+                hbm = (bx_m + blk_row) * fx.Int32(_D_ROW_B) + base_k_dense + blk_k * fx.Int32(24)
+                d0 = fx.make_rmem_tensor(2, Int32)  # bytes 0-7
+                d1 = fx.make_rmem_tensor(2, Int32)  # bytes 8-15
+                d2 = fx.make_rmem_tensor(2, Int32)  # bytes 16-23
+                fx.copy_atom_call(a_copy_64b, a_flat_div[None, hbm],                 d0)
+                fx.copy_atom_call(a_copy_64b, a_flat_div[None, hbm + fx.Int32(8)],  d1)
+                fx.copy_atom_call(a_copy_64b, a_flat_div[None, hbm + fx.Int32(16)], d2)
+                # Expand: pack [d0|d1] into reg_lo (16B), [d2|0] into reg_hi (16B)
+                # Vec.from_elements packs individual ir.Values; arith.constant gives i32 zero.
+                v_d0 = Vec(fx.memref_load_vec(d0))
+                v_d1 = Vec(fx.memref_load_vec(d1))
+                v_d2 = Vec(fx.memref_load_vec(d2))
+                c0 = _raw(fx.Int32(0))
+                reg_lo = fx.make_rmem_tensor(4, Int32)
+                reg_hi = fx.make_rmem_tensor(4, Int32)
+                reg_lo.store(Vec.from_elements(
+                    [_raw(v_d0[0]), _raw(v_d0[1]), _raw(v_d1[0]), _raw(v_d1[1])], Int32))
+                reg_hi.store(Vec.from_elements(
+                    [_raw(v_d2[0]), _raw(v_d2[1]), _raw(c0), _raw(c0)], Int32))
+                lds_i32 = blk_row * fx.Int32(A_ROW_I32) + blk_k * fx.Int32(8)
+                fx.copy(lds_copy, reg_lo, _lds_view(base_iter, lds_i32))
+                fx.copy(lds_copy, reg_hi, _lds_view(base_iter, lds_i32 + fx.Int32(4)))
+
+            _dense_total = BM * BK // 32
+            _dense_partial = _dense_total <= 256
+            _dense_blks_pt = max(1, _dense_total // 256)  # blocks per thread in full mode
+
+            def dense_load_a(kt, base_iter):
+                base_k_dense = kt * fx.Int32(BK * 3 // 4)
+                if const_expr(_dense_partial):
+                    # Partial mode: only threads [0, _dense_total) are active.
+                    # OOB loads return 0 (buffer bounds guard), so the load is safe for all;
+                    # store is guarded by scf.if to avoid writing garbage to LDS.
+                    blk_row = fx.Int32(tid) // fx.Int32(_D_KBLKS)
+                    blk_k   = fx.Int32(tid) % fx.Int32(_D_KBLKS)
+                    is_active = fx.Int32(tid) < fx.Int32(_dense_total)
+                    d0 = fx.make_rmem_tensor(2, Int32)
+                    d1 = fx.make_rmem_tensor(2, Int32)
+                    d2 = fx.make_rmem_tensor(2, Int32)
+                    hbm = (bx_m + blk_row) * fx.Int32(_D_ROW_B) + base_k_dense + blk_k * fx.Int32(24)
+                    fx.copy_atom_call(a_copy_64b, a_flat_div[None, hbm],                 d0)
+                    fx.copy_atom_call(a_copy_64b, a_flat_div[None, hbm + fx.Int32(8)],  d1)
+                    fx.copy_atom_call(a_copy_64b, a_flat_div[None, hbm + fx.Int32(16)], d2)
+                    if is_active:
+                        c0 = _raw(fx.Int32(0))
+                        v_d0 = Vec(fx.memref_load_vec(d0))
+                        v_d1 = Vec(fx.memref_load_vec(d1))
+                        v_d2 = Vec(fx.memref_load_vec(d2))
+                        reg_lo = fx.make_rmem_tensor(4, Int32)
+                        reg_hi = fx.make_rmem_tensor(4, Int32)
+                        reg_lo.store(Vec.from_elements(
+                            [_raw(v_d0[0]), _raw(v_d0[1]), _raw(v_d1[0]), _raw(v_d1[1])], Int32))
+                        reg_hi.store(Vec.from_elements(
+                            [_raw(v_d2[0]), _raw(v_d2[1]), _raw(c0), _raw(c0)], Int32))
+                        lds_i32 = blk_row * fx.Int32(A_ROW_I32) + blk_k * fx.Int32(8)
+                        fx.copy(lds_copy, reg_lo, _lds_view(base_iter, lds_i32))
+                        fx.copy(lds_copy, reg_hi, _lds_view(base_iter, lds_i32 + fx.Int32(4)))
+                else:
+                    # Full mode: each thread handles _dense_blks_pt consecutive blocks.
+                    for bi in range_constexpr(_dense_blks_pt):
+                        blk_lin = fx.Int32(bi * 256) + fx.Int32(tid)
+                        blk_row = blk_lin // fx.Int32(_D_KBLKS)
+                        blk_k   = blk_lin % fx.Int32(_D_KBLKS)
+                        _dense_one_block(base_k_dense, blk_row, blk_k, base_iter)
 
         # Async A: direct gmem->LDS DMA (buffer_load_lds), same row-major LDS layout as
         # coop_load_a. Issued after the B/scale loads so it overlaps the MFMAs.
@@ -449,9 +550,11 @@ def _compile_mxfp_blockscale_gemm(
 
         # Double-buffered LDS-A: prefetch tile iv+1's A into the other buffer while the
         # MFMAs compute tile iv. B/scales are loaded per-tile (latency hidden at 3 waves).
-        if const_expr(use_async_copy):
+        if const_expr(use_async_copy and not (dense_fp6 and a_dtype == "fp6")):
             dma_a_to_lds(fx.Int32(0), fx.Int32(0))
             rocdl.s_waitcnt(0)
+        elif const_expr(dense_fp6 and a_dtype == "fp6"):
+            dense_load_a(fx.Int32(0), _iter_of(fx.Int32(0)))
         else:
             coop_load_a(fx.Int32(0), _iter_of(fx.Int32(0)))
         gpu.barrier()
@@ -465,17 +568,19 @@ def _compile_mxfp_blockscale_gemm(
             pf_kt = nkt - nkt // fx.Int32(K_TILES)  # clamp last-iter prefetch to K_TILES-1
             chunk_kt = kt if tiles_per_chunk == 1 else kt // fx.Int32(tiles_per_chunk)
             scale_shift = None if tiles_per_chunk == 1 else (kt % fx.Int32(tiles_per_chunk)) * fx.Int32(16)
-            if const_expr(not use_async_copy):
+            if const_expr(dense_fp6 and a_dtype == "fp6"):
+                dense_load_a(pf_kt, _iter_of(nxt))  # prefetch A tile iv+1 -> LDS (dense)
+            elif const_expr(not use_async_copy):
                 coop_load_a(pf_kt, _iter_of(nxt))  # prefetch A tile iv+1 -> LDS
             av = read_a(cur)
             bv = load_b(kt)
             sa_v, sb_v = load_sc(chunk_kt)
-            if const_expr(use_async_copy):
+            if const_expr(use_async_copy and not (dense_fp6 and a_dtype == "fp6")):
                 dma_a_to_lds(pf_kt, nxt)  # A DMA AFTER B/scale loads -> overlaps the MFMAs
             accs = compute(accs, av, bv, sa_v, sb_v, scale_shift)  # overlaps the A prefetch
             if const_expr(enable_scheduler):
                 hot_loop_scheduler()
-            if const_expr(use_async_copy):
+            if const_expr(use_async_copy and not (dense_fp6 and a_dtype == "fp6")):
                 rocdl.s_waitcnt(0)  # drain the A DMA before the barrier
             gpu.barrier()
             results = yield accs
@@ -734,14 +839,19 @@ def compile_mxfp6_gemm(
     use_async_copy: bool = True,
     dsrd_preload: int = -1,
     dvmem_preload: int = -1,
+    dense_fp6: bool = False,
 ):
     """Compile MXFP6×MXFP4 (A6W4) preshuffle GEMM.
 
     Same signature as compile_mxfp4_gemm:
       fn(C, A, B, scale_a, scale_b, bias, M, N, stream)
 
-    A: MXFP6 E2M3, tight-packed fp6 (pack_fp6_e2m3 layout, 24 B per K=32
-       chunk) + 8 B zero pad = 32 B per chunk. scale_a/scale_b: E8M0 per-32.
+    A (dense_fp6=False, default): MXFP6 E2M3, FP8-padded layout — 24 B fp6 codes
+      + 8 B zero pad = 32 B per K=32 chunk. A row stride = K bytes.
+    A (dense_fp6=True): MXFP6 E2M3, dense layout — 24 B per K=32 chunk (no pad).
+      A row stride = K*3//4 bytes. The kernel expands 24B→32B in registers before
+      LDS write; the LDS layout and MFMA path are unchanged. Tile constraint:
+      tile_m*tile_k//32 must be ≤256 (partial mode) or divisible by 256 (full mode).
     B: CK-preshuffled MXFP4 E2M1.  bias unused (parity with compile_mxfp4_gemm).
 
     M_hint is used for tile selection when tile_m/tile_n/tile_k are not given.
@@ -757,6 +867,9 @@ def compile_mxfp6_gemm(
         tile_k = tile_k if tile_k is not None else cfg["tile_k"]
         if waves_per_eu is None:
             waves_per_eu = cfg["waves_per_eu"]
+    # dense_fp6 uses register-expand path (no DMA); disable async copy for correctness.
+    if dense_fp6:
+        use_async_copy = False
     return _compile_mxfp_blockscale_gemm(
         N=N,
         K=K,
@@ -770,4 +883,5 @@ def compile_mxfp6_gemm(
         use_async_copy=use_async_copy,
         dsrd_preload=dsrd_preload,
         dvmem_preload=dvmem_preload,
+        dense_fp6=dense_fp6,
     )
