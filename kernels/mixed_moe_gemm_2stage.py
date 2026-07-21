@@ -585,14 +585,13 @@ def compile_mixed_moe_gemm1(
             c_a_pack = arith.constant(int(a_elem_vec_pack), index=True)
             c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
 
-            # X: [tokens, model_dim]
+            # X: [tokens, model_dim] — unconditional x_rsrc to avoid Python closure bug.
+            # dense_a_fp6 uses a separate x_rsrc_dense; x_rsrc is for all non-dense paths.
+            x_nbytes_idx = (tokens_in * k_in * c_elem_bytes) / c_a_pack
+            x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
+            x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=False, num_records_bytes=x_nbytes_i32)
             if is_f6_a and dense_a_fp6:
-                # Dense fp6: K*3/4 bytes per row (no zero-pad). Use max_size.
-                x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=True)
-            else:
-                x_nbytes_idx = (tokens_in * k_in * c_elem_bytes) / c_a_pack
-                x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
-                x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=False, num_records_bytes=x_nbytes_i32)
+                x_rsrc_dense = buffer_ops.create_buffer_resource(arg_x, max_size=True)
 
             w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
 
@@ -1072,13 +1071,13 @@ def compile_mixed_moe_gemm1(
                         )
                         dw2_base = arith.addi(row_dw2_i32, kblk_off_i32)
 
-                        # 3 × dwordx2 (8B) loads
-                        d0 = buffer_ops.buffer_load(x_rsrc, dw2_base, vec_width=2, dtype=T.i32)
+                        # 3 × dwordx2 (8B) loads — use x_rsrc_dense for dense layout
+                        d0 = buffer_ops.buffer_load(x_rsrc_dense, dw2_base, vec_width=2, dtype=T.i32)
                         d1 = buffer_ops.buffer_load(
-                            x_rsrc, arith.addi(dw2_base, arith.constant(2, type=T.i32)), vec_width=2, dtype=T.i32
+                            x_rsrc_dense, arith.addi(dw2_base, arith.constant(2, type=T.i32)), vec_width=2, dtype=T.i32
                         )
                         d2 = buffer_ops.buffer_load(
-                            x_rsrc, arith.addi(dw2_base, arith.constant(4, type=T.i32)), vec_width=2, dtype=T.i32
+                            x_rsrc_dense, arith.addi(dw2_base, arith.constant(4, type=T.i32)), vec_width=2, dtype=T.i32
                         )
                         rocdl.s_waitcnt(0)  # wait for VMEM before LDS stores
 
