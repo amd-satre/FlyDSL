@@ -3020,20 +3020,18 @@ def compile_mixed_moe_gemm2(
             # X(A2): buffer size in bytes, accounting for FP4 packing (2 elements per byte).
             # fp8/int8: 1 byte per element  -> bytes = tokens*topk * K
             # fp4:      2 elements per byte -> bytes = tokens*topk * K / 2
-            # fp6 dense: 3/4 byte per element -> bytes = tokens*topk * K * 3 / 4
-            # x_rsrc: buffer resource for A (activation) matrix.
-            # For fp6 dense: use max_size=True (dense layout: K*3/4 bytes/row, not inferrable).
-            # For all other layouts: use explicit num_records_bytes for OOB safety.
-            # Use const_expr to avoid Python closure-capture issues with if/else assignments
-            # (regular Python if/else breaks closure for dma_x_tile_to_lds nested inside
-            # _moe_gemm2_then_body; const_expr dispatch is handled correctly by FlyDSL tracing).
+            # Unconditional x_rsrc: use explicit bounds for OOB safety.
+            # Dense fp6 uses max_size=True via a SEPARATE x_rsrc_dense variable inside the
+            # dense loading code; this keeps x_rsrc unconditional so Python closure capture
+            # works correctly for dma_x_tile_to_lds nested inside _moe_gemm2_then_body.
             c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
-            if const_expr(is_f6_a and dense_a_fp6):
-                x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=True)
-            else:
-                x_nbytes_idx = _div_pow2((tokens_in * c_topk) * k_in * c_elem_bytes, int(a_elem_vec_pack))
-                x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
-                x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=False, num_records_bytes=x_nbytes_i32)
+            x_nbytes_idx = _div_pow2((tokens_in * c_topk) * k_in * c_elem_bytes, int(a_elem_vec_pack))
+            x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
+            x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=False, num_records_bytes=x_nbytes_i32)
+            # Dense fp6 activation: separate resource descriptor with max_size=True.
+            # Only used inside the dense loading code path; x_rsrc above is for all non-dense paths.
+            if is_f6_a and dense_a_fp6:
+                x_rsrc_dense = buffer_ops.create_buffer_resource(arg_x, max_size=True)
 
             w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
 
@@ -3818,12 +3816,13 @@ def compile_mixed_moe_gemm2(
                         dw2_base = arith.addi(row_dw2_i32, kblk_off_i32)
 
                         # 3 × dwordx2 (8B) loads — 24B real data per K=32 block
-                        d0 = buffer_ops.buffer_load(x_rsrc, dw2_base, vec_width=2, dtype=T.i32)
+                        # Use x_rsrc_dense (max_size=True) for the dense layout
+                        d0 = buffer_ops.buffer_load(x_rsrc_dense, dw2_base, vec_width=2, dtype=T.i32)
                         d1 = buffer_ops.buffer_load(
-                            x_rsrc, arith.addi(dw2_base, arith.constant(2, type=T.i32)), vec_width=2, dtype=T.i32
+                            x_rsrc_dense, arith.addi(dw2_base, arith.constant(2, type=T.i32)), vec_width=2, dtype=T.i32
                         )
                         d2 = buffer_ops.buffer_load(
-                            x_rsrc, arith.addi(dw2_base, arith.constant(4, type=T.i32)), vec_width=2, dtype=T.i32
+                            x_rsrc_dense, arith.addi(dw2_base, arith.constant(4, type=T.i32)), vec_width=2, dtype=T.i32
                         )
                         # Wait for VMEM loads before LDS stores
                         rocdl.s_waitcnt(0)
