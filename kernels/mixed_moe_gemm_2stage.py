@@ -260,7 +260,9 @@ def compile_mixed_moe_gemm1(
 
     _fp4q_tag = "_fp4q" if _need_fp4 else ""
     _fp8q_tag = "_fp8q" if _need_fp8 else ""
-    _fp6q_tag = "_fp6q" if _need_fp6 else ""
+    # Layout-qualified tag prevents loading the earlier unpacked-code HSACO
+    # from a persistent runtime cache after upgrading this producer contract.
+    _fp6q_tag = "_fp6q_packed4" if _need_fp6 else ""
     _sort_tag = "_sort" if _need_sort else ""
     _async_tag = "_async" if use_async_copy else ""
     _sk_tag = f"_sk{k_batch}" if _is_splitk else ""
@@ -326,6 +328,11 @@ def compile_mixed_moe_gemm1(
     _e_vec_s1 = min(tile_n // 32, 8)
     if _need_quant:
         _e_vec_s1 = max(2, _e_vec_s1)
+    if _need_fp6 and (_e_vec_s1 % 4) != 0:
+        raise ValueError(
+            "fused fp6 epilogue requires four contiguous output elements per "
+            f"CShuffle lane, got e_vec={_e_vec_s1} (tile_n={tile_n})"
+        )
     _num_threads_per_quant_blk_s1 = 32 // _e_vec_s1
     _shuffle_dists_s1 = []
     _sh_val = 1
@@ -2074,6 +2081,8 @@ def compile_mixed_moe_gemm1(
                 _c4_i32 = arith.constant(4, type=T.i32)
                 _c5_i32 = arith.constant(5, type=T.i32)
                 _c15_i32 = arith.constant(15, type=T.i32)
+                _c19_i32 = arith.constant(19, type=T.i32)
+                _c20_i32 = arith.constant(20, type=T.i32)
                 _c22_i32 = arith.constant(22, type=T.i32)
                 _c23_i32 = arith.constant(23, type=T.i32)
                 _c28_i32 = arith.constant(28, type=T.i32)
@@ -2084,6 +2093,9 @@ def compile_mixed_moe_gemm1(
                 _c256_i32 = arith.constant(256, type=T.i32)
                 _c0xFF800000_i32 = arith.constant(0xFF800000, type=T.i32)
                 _c0x400000_i32 = arith.constant(0x400000, type=T.i32)
+                _c0x80000_i32 = arith.constant(0x80000, type=T.i32)
+                _c0x7FFFF_i32 = arith.constant(0x7FFFF, type=T.i32)
+                _c0x7FFFFF_i32 = arith.constant(0x7FFFFF, type=T.i32)
                 _c0x7FFFFFFF_i32 = arith.constant(0x7FFFFFFF, type=T.i32)
                 _c0x80000000_i32 = arith.constant(0x80000000, type=T.i32)
                 _c0x3F800000_i32 = arith.constant(0x3F800000, type=T.i32)  # 1.0f
@@ -2152,10 +2164,33 @@ def compile_mixed_moe_gemm1(
                             local_max = arith.maximumf(local_max, peer)
 
                         max_i32 = local_max.bitcast(T.i32)
-                        # Match fp4_utils.f32_to_e8m0(max_abs / 4): round the
-                        # exponent at the 1.5x threshold before dropping mantissa.
-                        max_rounded = (max_i32 + _c0x400000_i32) & _c0xFF800000_i32
-                        exp_field = max_rounded >> _c23_i32
+                        if const_expr(_need_fp6):
+                            # Match quant_act_a6_flydsl exactly.  E2M3 scale
+                            # selection first rounds the block maximum to three
+                            # mantissa bits (RTNE); only a mantissa carry changes
+                            # the E8M0 exponent.  Reusing fp4's 1.5x threshold
+                            # changes roughly one third of real MoE blocks.
+                            mant_bits = max_i32 & _c0x7FFFFF_i32
+                            round_bit = (mant_bits >> _c19_i32) & _c1_i32
+                            sticky_nz = arith.cmpi(
+                                CmpIPredicate.ne,
+                                mant_bits & _c0x7FFFF_i32,
+                                _c0_i32,
+                            ).select(_c1_i32, _c0_i32)
+                            lsb_result = (mant_bits >> _c20_i32) & _c1_i32
+                            round_up = round_bit & (sticky_nz | lsb_result)
+                            max_rounded = max_i32 + round_up * _c0x80000_i32
+                            exp_field = (
+                                max_rounded & _c0xFF800000_i32
+                            ) >> _c23_i32
+                        else:
+                            # Match fp4_utils.f32_to_e8m0(max_abs / 4): round
+                            # the exponent at the 1.5x threshold before dropping
+                            # the mantissa (also retained for the fp8 path).
+                            max_rounded = (
+                                max_i32 + _c0x400000_i32
+                            ) & _c0xFF800000_i32
+                            exp_field = max_rounded >> _c23_i32
                         e8m0_biased = arith.maxsi(exp_field - _c_headroom_i32, _c0_i32)
 
                         quant_exp = _c254_i32 - e8m0_biased
@@ -2250,15 +2285,22 @@ def compile_mixed_moe_gemm1(
                                     )
 
                         elif const_expr(_need_fp6):
-                            # fp6-E2M3: each element → 6-bit code stored in 1 uint8.
-                            # Use _f32_to_e2m3 (ported from quant_act_a6_flydsl.py).
+                            # fp6-E2M3 codes use the same padded-packed layout
+                            # consumed by the stage-2 MFMA path: each logical
+                            # K=32 block occupies 32 bytes (24 tightly packed
+                            # code bytes followed by 8 zero bytes).  The caller
+                            # owns zero-once initialization of those pad bytes.
                             def _f32_to_e2m3_local(qx_f32):
                                 """f32 → fp6-E2M3 code in low 6 bits of i32.
                                 E2M3: 1 sign + 2 exp + 3 mant, max=7.5, bias=1."""
                                 qx = qx_f32.bitcast(T.i32)
                                 s = qx & _c0x80000000_i32
                                 e = (qx >> _c23_i32) & _c0xFF_i32
-                                m = qx & _c0x7FFFFFFF_i32
+                                # Mantissa only.  Masking with 0x7fffffff (the
+                                # earlier port) leaked exponent bits into both
+                                # normal and denormal rounding and corrupted
+                                # roughly half of all emitted FP6 codes.
+                                m = qx & _c0x7FFFFF_i32
                                 c126 = arith.constant(126, type=T.i32)
                                 adj_exp = arith.maxsi(c126 - e, _c0_i32)
                                 m_denorm = (arith.constant(0x400000, type=T.i32) | (m >> _c1_i32)) >> adj_exp
@@ -2285,34 +2327,63 @@ def compile_mixed_moe_gemm1(
                             for i in range_constexpr(_e_vec):
                                 fp6_vals.append(_f32_to_e2m3_local(frag_vals[i] * quant_scale))
 
-                            # Store _e_vec uint8 codes; pack 4 per i32 word, handle tail.
-                            ptr_addr_idx = row_byte_base + col_g0
-                            for _wg in range_constexpr(_e_vec // 4):
-                                _b = _wg * 4
-                                packed_w = fp6_vals[_b]
-                                packed_w = packed_w | (fp6_vals[_b + 1] << _c8_i32)
-                                packed_w = packed_w | (fp6_vals[_b + 2] << arith.constant(16, type=T.i32))
-                                packed_w = packed_w | (fp6_vals[_b + 3] << arith.constant(24, type=T.i32))
-                                word_ptr = ptr_addr_idx + arith.constant(_wg * 4, index=True)
-                                out_ptr_v = _idx_to_llvm_ptr(word_ptr)
-                                packed_raw = packed_w._value if hasattr(packed_w, "_value") else packed_w
-                                llvm.StoreOp(packed_raw, out_ptr_v, alignment=4, nontemporal=True)
-                            # Remainder bytes (when _e_vec % 4 != 0)
-                            _rem_base = (_e_vec // 4) * 4
-                            if const_expr(_e_vec % 4 >= 2):
-                                packed_h = fp6_vals[_rem_base] | (fp6_vals[_rem_base + 1] << _c8_i32)
-                                h_ptr = ptr_addr_idx + arith.constant(_rem_base, index=True)
-                                out_ptr_v = _idx_to_llvm_ptr(h_ptr)
-                                packed_h16 = arith.TruncIOp(T.i16, packed_h)
-                                packed_raw = packed_h16._value if hasattr(packed_h16, "_value") else packed_h16
-                                llvm.StoreOp(packed_raw, out_ptr_v, alignment=2, nontemporal=True)
-                            if const_expr(_e_vec % 2 == 1):
-                                last_idx = _e_vec - 1
-                                b_ptr = ptr_addr_idx + arith.constant(last_idx, index=True)
-                                out_ptr_v = _idx_to_llvm_ptr(b_ptr)
-                                packed_b = arith.TruncIOp(T.i8, fp6_vals[last_idx])
-                                packed_raw = packed_b._value if hasattr(packed_b, "_value") else packed_b
-                                llvm.StoreOp(packed_raw, out_ptr_v, alignment=1, nontemporal=True)
+                            # Bit-pack each four adjacent codes into three bytes.
+                            # CShuffle gives every participating lane 4 or 8
+                            # adjacent columns, so no cross-lane exchange is
+                            # needed.  Use byte stores because successive packed
+                            # groups begin at offsets 0, 3, 6, 9, ...; the paired
+                            # lane/i16 alternative was slower at production M.
+                            c_3f = arith.constant(0x3F, type=T.i32)
+                            c_0f = arith.constant(0x0F, type=T.i32)
+                            c_sh6 = arith.constant(6, type=T.i32)
+                            for _pg in range_constexpr(_e_vec // 4):
+                                _b = _pg * 4
+                                q0 = fp6_vals[_b]
+                                q1 = fp6_vals[_b + 1]
+                                q2 = fp6_vals[_b + 2]
+                                q3 = fp6_vals[_b + 3]
+                                packed_b0 = ((q1 & _c3_i32) << c_sh6) | (q0 & c_3f)
+                                packed_b1 = ((q2 & c_0f) << _c4_i32) | (
+                                    (q1 >> _c2_i32) & c_0f
+                                )
+                                packed_b2 = (q3 << _c2_i32) | (q2 >> _c4_i32)
+
+                                logical_col = col_g0 + arith.constant(
+                                    _b, index=True
+                                )
+                                k_block = logical_col / arith.constant(
+                                    32, index=True
+                                )
+                                col_in_block = logical_col - k_block * arith.constant(
+                                    32, index=True
+                                )
+                                packed_group = col_in_block / arith.constant(
+                                    4, index=True
+                                )
+                                packed_off = (
+                                    k_block * arith.constant(32, index=True)
+                                    + packed_group * arith.constant(3, index=True)
+                                )
+                                ptr_addr_idx = row_byte_base + packed_off
+                                for _byte_i, _byte_val in enumerate(
+                                    (packed_b0, packed_b1, packed_b2)
+                                ):
+                                    byte_ptr = ptr_addr_idx + arith.constant(
+                                        _byte_i, index=True
+                                    )
+                                    out_ptr_v = _idx_to_llvm_ptr(byte_ptr)
+                                    packed_byte = arith.TruncIOp(T.i8, _byte_val)
+                                    packed_raw = (
+                                        packed_byte._value
+                                        if hasattr(packed_byte, "_value")
+                                        else packed_byte
+                                    )
+                                    llvm.StoreOp(
+                                        packed_raw,
+                                        out_ptr_v,
+                                        alignment=1,
+                                        nontemporal=True,
+                                    )
 
                         if const_expr(_need_sort):
                             col_g0_i32 = arith.index_cast(T.i32, col_g0)

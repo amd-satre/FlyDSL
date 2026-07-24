@@ -17,9 +17,9 @@ from kernels.mxfp4_preshuffle import compile_mxfp6_gemm
 from tests.kernels.utils import fp4_utils
 
 DEV = "cuda"
-NTRIALS = 5
-WARMUP  = 20
-REP     = 80
+NTRIALS = 7
+WARMUP  = 50
+REP     = 120
 
 # DeepSeek-R1 dense + MoE shapes (N, K, label)
 SHAPES = [
