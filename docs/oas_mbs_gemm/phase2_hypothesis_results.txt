@@ -1,0 +1,25 @@
+Hypothesis #1: OAS improves QSNR over plain MXFP4-16 by ~0.5 dB, affecting ~15% of blocks.
+Hypothesis #2: MBS-Static adds ~+1.1 dB over MXFP4-16-OAS; MBS-Dynamic adds ~+1.6 dB over MXFP4-16-OAS (paper Sec 4.3.3).
+
+=== Gaussian activation-like tensor  shape=(4096, 4096) ===
+MXFP4-16 (no OAS):      QSNR =  18.95 dB
+MXFP4-16 + OAS:         QSNR =  19.17 dB  (delta vs base: +0.21 dB)
+MXFP4-16 + OAS + MBS-S: QSNR =  19.39 dB  (delta vs OAS: +0.23 dB)
+MXFP4-16 + OAS + MBS-D: QSNR =  20.14 dB  (delta vs OAS: +0.97 dB)
+Fraction of 16-blocks OAS bumps: 19.7%  (paper reports ~15%)
+
+=== Outlier-heavy tensor (1% outliers @ ~25x scale)  shape=(4096, 4096) ===
+MXFP4-16 (no OAS):      QSNR =  20.60 dB
+MXFP4-16 + OAS:         QSNR =  20.93 dB  (delta vs base: +0.33 dB)
+MXFP4-16 + OAS + MBS-S: QSNR =  21.68 dB  (delta vs OAS: +0.75 dB)
+MXFP4-16 + OAS + MBS-D: QSNR =  22.35 dB  (delta vs OAS: +1.42 dB)
+Fraction of 16-blocks OAS bumps: 29.5%  (paper reports ~15%)
+
+=== Macro-block-size ablation (Appendix A): expect near-monotonic
+    QSNR decrease as macro block grows from 32 to 512, with 128 a
+    good compromise (paper: ~96% of MBS=32's QSNR retained at 128).
+  macro_block=  32: QSNR =  19.94 dB  (vs OAS-only baseline  19.17 dB, delta +0.77 dB)
+  macro_block=  64: QSNR =  19.60 dB  (vs OAS-only baseline  19.17 dB, delta +0.43 dB)
+  macro_block= 128: QSNR =  19.40 dB  (vs OAS-only baseline  19.17 dB, delta +0.23 dB)
+  macro_block= 256: QSNR =  19.28 dB  (vs OAS-only baseline  19.17 dB, delta +0.12 dB)
+  macro_block= 512: QSNR =  19.23 dB  (vs OAS-only baseline  19.17 dB, delta +0.06 dB)
