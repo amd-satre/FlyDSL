@@ -12,14 +12,17 @@ multiply by the per-row/per-col MBS correction, and add into the running
 sum -- exactly the control flow kernels/mxfp4_preshuffle.py's compute() would
 need per (kh, ni, mi) iteration.
 """
+
 import sys
 
 sys.path.insert(0, "/scratch/satre/FlyDSL")
 
 import torch  # noqa: E402
 
-from tests.kernels.utils import fp4_utils  # noqa: E402
-from tests.kernels.utils import oas_mbs_quant  # noqa: E402
+from tests.kernels.utils import (
+    fp4_utils,  # noqa: E402
+    oas_mbs_quant,  # noqa: E402
+)
 
 torch.manual_seed(0)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -11,14 +11,17 @@ Checks:
     on the outlier-heavy tensor than the Gaussian one (the qualitative check
     that matters most, per Phase 2's findings).
 """
+
 import sys
 
 sys.path.insert(0, "/scratch/satre/FlyDSL")
 
 import torch  # noqa: E402
 
-from tests.kernels.utils import fp4_utils  # noqa: E402
-from tests.kernels.utils import oas_mbs_quant  # noqa: E402
+from tests.kernels.utils import (
+    fp4_utils,  # noqa: E402
+    oas_mbs_quant,  # noqa: E402
+)
 
 torch.manual_seed(0)
 

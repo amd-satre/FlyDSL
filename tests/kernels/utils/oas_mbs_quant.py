@@ -56,7 +56,7 @@ def per_1x32_f4_quant_oas(x: torch.Tensor):
     xb = x2.reshape(-1, _BLOCK)
     max_abs = torch.amax(torch.abs(xb.float()), 1)
 
-    nominal_e8m0 = fp4_utils.f32_to_e8m0(max_abs / (2.0**int(torch.log2(torch.tensor(F4E2M1_MAX)).item())))
+    nominal_e8m0 = fp4_utils.f32_to_e8m0(max_abs / (2.0 ** int(torch.log2(torch.tensor(F4E2M1_MAX)).item())))
     # NOTE: e8m0 is a "minifloat" dtype whose *value* when cast to float32 is
     # 2^(biased_exp-127) -- `.to(torch.int32)` would truncate that value (~0),
     # not extract the bits. Must reinterpret via `.view(torch.uint8)` to get
@@ -119,3 +119,18 @@ def per_1x32_f4_quant_oas_mbs(x: torch.Tensor, macro_block: int = _MACRO_BLOCK):
 
     y_fp4, scale_e8m0, y = per_1x32_f4_quant_oas(x_scaled)
     return y_fp4, scale_e8m0, m8, factor
+
+
+def shuffle_mbs_scale_w4(m8: torch.Tensor, rows_padded: int) -> torch.Tensor:
+    """Transpose+pad the per-row MBS mantissa tensor from ``[rows, K/128]`` to
+    ``[K/128, rows_padded]`` so that, for a fixed macro-block index, the 4
+    consecutive rows one lane needs (see PHASE3_MBS_KERNEL_DESIGN.md) are
+    contiguous in memory -- one dword (4-byte) buffer load per lane per macro
+    block instead of 4 separate strided byte loads. Padding rows beyond
+    ``rows`` are zero, which decodes to an MBS factor of 1.0 (no-op) for the
+    ragged tail past M or N.
+    """
+    rows, k_macro = m8.shape
+    out = torch.zeros(k_macro, rows_padded, dtype=torch.uint8, device=m8.device)
+    out[:, :rows] = m8.T
+    return out.contiguous()

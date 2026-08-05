@@ -1,0 +1,12 @@
+
+=== Gaussian A  (M=256, N=8192, K=8192) ===
+    [correctness] mean_abs_err=0.1011 (0.14% of ref mean abs)
+  QSNR vs BF16 truth: baseline=15.78 dB  OAS=16.07 dB  OAS+MBS=16.33 dB
+  deltas: OAS-baseline=+0.30 dB   MBS-OAS=+0.25 dB   MBS-baseline=+0.55 dB
+
+=== Outlier-heavy A  (M=256, N=8192, K=8192) ===
+    [correctness] mean_abs_err=0.2636 (0.14% of ref mean abs)
+  QSNR vs BF16 truth: baseline=15.80 dB  OAS=16.12 dB  OAS+MBS=16.43 dB
+  deltas: OAS-baseline=+0.32 dB   MBS-OAS=+0.30 dB   MBS-baseline=+0.62 dB
+
+DONE.

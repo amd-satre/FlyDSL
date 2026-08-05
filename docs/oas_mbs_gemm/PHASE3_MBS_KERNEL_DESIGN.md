@@ -120,10 +120,42 @@ unmodified.
 3. `debug-flydsl-kernel` skill's playbook (clear `~/.flydsl/cache`, all-1s
    test, single-partition test) if results are wrong rather than crashing.
 
-## Not yet done (this is the actual remaining Phase 3 work)
+## Status: implemented and GPU-verified (2026-08-05)
 
-- `shuffle_mbs_scale_w4`-equivalent host transpose function.
-- `load_mbs()` kernel routine.
-- The `tmp`/Hadamard-correction rewrite of `compute()`, gated by `use_mbs`.
-- Wiring `arg_mbs_a`/`arg_mbs_b` through `compile_mxfp4_gemm`/`launch_gemm`.
-- New correctness tests mirroring `test_mfma_w4_flyc_preshuffle`.
+All of the above is done, as a **separate** kernel file
+`kernels/mxfp4_preshuffle_mbs.py` (not a modification of the production
+`mxfp4_preshuffle.py` — zero risk to its tuned/scheduled path or its 106
+passing tests):
+
+- `tests/kernels/utils/oas_mbs_quant.py::shuffle_mbs_scale_w4` — the host
+  transpose function.
+- `load_mbs()` — the per-macro-block scale-load routine.
+- `compute_with_macro()` — the local-accumulate + Hadamard-correction rewrite.
+- `arg_mbs_a`/`arg_mbs_b` threaded through `compile_mxfp4_gemm_mbs`/
+  `launch_gemm`.
+- `tests/kernels/test_mxfp4_oas_mbs_gemm.py` — correctness tests mirroring
+  `test_mfma_w4_flyc_preshuffle`'s structure (6/6 pass, both `k_halves`
+  values, bf16/fp16 output).
+
+One real bug found via GPU debugging: `rocdl.readfirstlane` was wrapping the
+*entire* per-lane MBS byte address including the lane-varying `lane_div_16*4`
+term, silently broadcasting lane 0's value to every lane (symptom: rows with
+`lane_div_16==0` matched to ~0.01 error, every other row had 1-9 magnitude
+error). Fixed by only broadcasting the workgroup-uniform part and adding the
+per-lane offset after — the same pattern the existing `load_sc()` already
+uses for the e8m0 scale.
+
+Full accuracy chain on real gfx950 hardware, M=256/N=8192/K=8192:
+baseline MXFP4 15.78-15.80 dB -> +OAS +0.30/+0.32 dB -> +OAS+MBS +0.25/+0.30 dB
+more (total **+0.55/+0.62 dB** vs baseline, Gaussian/outlier-heavy A). See
+`docs/oas_mbs_gemm/phase3_mbs_gemm_gpu_verification.txt`.
+
+**Explicitly not done** (this file was correctness-first per the plan; Phase 4
+is where this gets addressed): no `hot_loop_scheduler` instruction scheduling,
+no async-copy DMA for A — both of which the production kernel uses for
+performance. Before comparing performance against the production kernel in
+Phase 4, either (a) port those scheduling/DMA optimizations into this file, or
+(b) fold the MBS logic into `mxfp4_preshuffle.py` directly behind a `use_mbs`
+flag so it inherits them for free. (b) is likely less error-prone since it
+reuses already-tuned code instead of re-deriving scheduler tuning from
+scratch.

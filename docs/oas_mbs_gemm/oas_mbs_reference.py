@@ -7,6 +7,7 @@ on synthetic data before writing any kernel code.
 
 Run: python3 oas_mbs_reference.py
 """
+
 import numpy as np
 
 FP4_GRID = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float64)
@@ -142,10 +143,11 @@ def report(name: str, x: np.ndarray):
 
 
 if __name__ == "__main__":
-    print("Hypothesis #1: OAS improves QSNR over plain MXFP4-16 by ~0.5 dB, "
-          "affecting ~15% of blocks.")
-    print("Hypothesis #2: MBS-Static adds ~+1.1 dB over MXFP4-16-OAS; "
-          "MBS-Dynamic adds ~+1.6 dB over MXFP4-16-OAS (paper Sec 4.3.3).")
+    print("Hypothesis #1: OAS improves QSNR over plain MXFP4-16 by ~0.5 dB, " "affecting ~15% of blocks.")
+    print(
+        "Hypothesis #2: MBS-Static adds ~+1.1 dB over MXFP4-16-OAS; "
+        "MBS-Dynamic adds ~+1.6 dB over MXFP4-16-OAS (paper Sec 4.3.3)."
+    )
 
     report("Gaussian activation-like tensor", make_gaussian(4096, 4096))
     report("Outlier-heavy tensor (1% outliers @ ~25x scale)", make_outlier_heavy(4096, 4096))
@@ -157,5 +159,7 @@ if __name__ == "__main__":
     oas = qsnr_db(x, quantize_mxfp4_block(x, block=16, use_oas=True))
     for mb in (32, 64, 128, 256, 512):
         q = qsnr_db(x, quantize_mbs(x, block=16, macro_block=mb, use_oas=True, dynamic=False))
-        print(f"  macro_block={mb:4d}: QSNR = {q:6.2f} dB  (vs OAS-only baseline {oas:6.2f} dB, "
-              f"delta {q - oas:+.2f} dB)")
+        print(
+            f"  macro_block={mb:4d}: QSNR = {q:6.2f} dB  (vs OAS-only baseline {oas:6.2f} dB, "
+            f"delta {q - oas:+.2f} dB)"
+        )

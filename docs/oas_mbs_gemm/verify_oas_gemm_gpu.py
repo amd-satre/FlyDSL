@@ -11,6 +11,7 @@ kernel (compile_mxfp4_gemm) and confirm:
 
 Run inside the satre-oas-mbs-flydsl container (needs GPU + built FlyDSL).
 """
+
 import sys
 
 sys.path.insert(0, "/scratch/satre/FlyDSL")
@@ -20,8 +21,10 @@ import torch  # noqa: E402
 import flydsl.compiler as flyc  # noqa: E402
 from flydsl.runtime.device import get_rocm_arch  # noqa: E402
 from kernels.mxfp4_preshuffle import compile_mxfp4_gemm  # noqa: E402
-from tests.kernels.utils import fp4_utils  # noqa: E402
-from tests.kernels.utils import oas_mbs_quant  # noqa: E402
+from tests.kernels.utils import (
+    fp4_utils,  # noqa: E402
+    oas_mbs_quant,  # noqa: E402
+)
 
 torch.manual_seed(0)
 device = torch.device("cuda")
@@ -117,8 +120,10 @@ if __name__ == "__main__":
 
         q_base = qsnr_db(bf16_ref, c_base)
         q_oas = qsnr_db(bf16_ref, c_oas)
-        print(f"  GEMM output QSNR vs true BF16 matmul: baseline={q_base:.2f} dB, OAS={q_oas:.2f} dB "
-              f"(delta {q_oas - q_base:+.2f} dB)")
+        print(
+            f"  GEMM output QSNR vs true BF16 matmul: baseline={q_base:.2f} dB, OAS={q_oas:.2f} dB "
+            f"(delta {q_oas - q_base:+.2f} dB)"
+        )
         assert q_oas >= q_base - 0.05, "OAS-quantized GEMM should not be meaningfully worse than baseline"
 
     print("\nPASS: OAS quantization is a correct, zero-kernel-change drop-in; GEMM accuracy improves.")
