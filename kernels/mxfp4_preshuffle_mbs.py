@@ -4,12 +4,14 @@
 """MXFP4 (E2M1) preshuffle GEMM with Overflow-Aware Scaling (OAS) + Macro
 Block Scaling (MBS), per arXiv:2603.08713 Sec 4.2/4.3.
 
-Correctness-first variant: this is deliberately a simplified copy of
-``kernels/mxfp4_preshuffle.py``'s fp4 path (no async-copy DMA, no MFMA
-instruction scheduler hints) with MBS added, per
-``docs/oas_mbs_gemm/PHASE3_MBS_KERNEL_DESIGN.md``. Performance tuning
-(matching or exceeding the production kernel's scheduler/async-copy tricks) is
-Phase 4's job, not this file's.
+This ports the production ``kernels/mxfp4_preshuffle.py``'s async-copy DMA and
+MFMA instruction scheduler (Phase 4 tuning, see
+``docs/oas_mbs_gemm/PHASE4_TUNING_NOTES.md``) onto the MBS-augmented main loop
+from Phase 3 (``docs/oas_mbs_gemm/PHASE3_MBS_KERNEL_DESIGN.md``). The MBS
+scale loads (``load_mbs``) are deliberately NOT counted in the scheduler's
+vmem/ds interleave counts -- they're a small, fixed 1-dword-per-mi +
+1-byte-per-ni load per K-tile, negligible next to the B-tile stream -- so the
+scheduler hints are copied unmodified from the production kernel.
 
 MBS: each 16x16x128 scaled-MFMA call already covers exactly one 128-K macro
 block (this hardware's native scaled-MFMA granularity happens to match MBS's
@@ -92,6 +94,16 @@ def compile_mxfp4_gemm_mbs(
     # call). M/N padded to 32 like the existing e8m0 scale bound.
     K_MACRO = K // 128
 
+    # Scheduler counts (sched_group_barrier interleave), per loop iter --
+    # copied unmodified from kernels/mxfp4_preshuffle.py's fp4 (non-fp6) path.
+    sched_mfma_total = k_halves * m_chunks * num_acc_n
+    sched_num_ds_load = m_chunks * k_halves  # A LDS reads/thread (read_a)
+    sched_num_gmem = n_coop + num_acc_n * k_halves + m_pairs + n_pairs  # A coop + B + scales
+    sched_num_a_dswr = 0  # async copy -> no explicit A LDS writes to schedule
+    enable_scheduler = num_acc_n <= 2 or True  # always async-copy here, like use_async_copy=True upstream
+    dsrd_preload = sched_num_ds_load
+    dvmem_preload = sched_num_gmem
+
     @fx.struct
     class SharedA:
         a0: fx.Array[Int8, A_LDS_B, 16]
@@ -121,7 +133,6 @@ def compile_mxfp4_gemm_mbs(
         bx_m = bid_x * fx.Int32(BM)
         by_n = bid_y * fx.Int32(BN)
 
-        a_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
         _i8g = fx.PointerType.get(T.i8, address_space=fx.AddressSpace.Global, alignment=16)
         a_nrec = fx.Int64(i32_m) * fx.Int64(a_row_bytes)
         a_flat = fx.rocdl.make_buffer_tensor(
@@ -135,6 +146,9 @@ def compile_mxfp4_gemm_mbs(
         lds_db = fx.Int32(fx.ptrtoint(lds.a1.ptr)) - fx.Int32(fx.ptrtoint(lds.a0.ptr))
         lds_db_i32 = lds_db // fx.Int32(4)
         lds_copy = fx.make_copy_atom(fx.UniversalCopy128b(), Int32)
+        dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+        _i8s = fx.PointerType.get(Int8.ir_type, fx.AddressSpace.Shared, 512)
+        sA0_i8 = fx.recast_iter(_i8s, lds.a0.ptr)
 
         def _iter_of(parity):
             return fx.add_offset(sA0_i32, parity * lds_db_i32)
@@ -142,16 +156,23 @@ def compile_mxfp4_gemm_mbs(
         def _lds_view(base_iter, off_i32):
             return fx.make_view(fx.add_offset(base_iter, off_i32), fx.make_layout(4, 1))
 
-        def coop_load_a(kt, base_iter):
+        def dma_a_to_lds(kt, parity):
+            # Direct gmem->LDS DMA (buffer_load_lds), same row-major LDS layout
+            # as coop_load_a. Issued after the B/scale loads so it overlaps
+            # the MFMAs (copied unmodified from kernels/mxfp4_preshuffle.py).
+            base_off = rocdl.readfirstlane(T.i32, parity * lds_db + wave * fx.Int32(64 * 16))
+            lds_ptr = fx.add_offset(sA0_i8, base_off)
             base_k_byte = kt * fx.Int32(A_ROW_B)
             for i in range_constexpr(n_coop):
+                if const_expr(i > 0):
+                    lds_ptr = fx.add_offset(lds_ptr, fx.Int32(256 * 16))
                 lin = (fx.Int32(i * 256) + fx.Int32(tid)) * fx.Int32(16)
                 row = lin // fx.Int32(A_ROW_B)
                 col = lin % fx.Int32(A_ROW_B)
                 gmem_byte = (bx_m + row) * fx.Int32(a_row_bytes) + base_k_byte + col
-                reg = fx.make_rmem_tensor(4, Int32)
-                fx.copy_atom_call(a_copy, a_flat_div[None, gmem_byte], reg)
-                fx.copy(lds_copy, reg, _lds_view(base_iter, row * fx.Int32(A_ROW_I32) + col // fx.Int32(4)))
+                dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
+                src = fx.slice(a_flat_div, (None, gmem_byte))
+                fx.copy(dma_atom, src, dst)
 
         def _read16(base_iter, off_i32):
             t = fx.make_rmem_tensor(4, Int32)
@@ -271,22 +292,33 @@ def compile_mxfp4_gemm_mbs(
         def _byte_to_recip(byte_i32_raw):
             # (1 + m8/256)^-1, computed in fp32. byte_i32_raw: raw i32 ir.Value,
             # 0..255 (sign doesn't matter -- always non-negative in that range).
+            #
+            # `factor` is always in [1, 2) (well-conditioned), so a single
+            # hardware v_rcp_f32 (rocdl.rcp) is enough -- no Newton-Raphson
+            # refinement needed. Measured: arith.divf-based division here was
+            # the dominant cost of the entire MBS kernel (~130us -> ~53us,
+            # i.e. bringing this kernel to within a few % of baseline, when
+            # ablated away in isolation) -- see docs/oas_mbs_gemm/PHASE4_TUNING_NOTES.md.
             m8_f = arith.uitofp(T.f32, byte_i32_raw)
             one = arith.constant(1.0, type=T.f32)
-            two56 = arith.constant(256.0, type=T.f32)
-            factor = arith.addf(one, arith.divf(m8_f, two56))
-            return fx.Float32(arith.divf(one, factor))
+            inv256 = arith.constant(1.0 / 256.0, type=T.f32)
+            factor = arith.addf(one, arith.mulf(m8_f, inv256))
+            return fx.Float32(rocdl.rcp(T.f32, factor))
 
         def load_mbs(macro_kt):
             # A: one dword per mi = 4 contiguous row-bytes at
             # (macro_kt * m_pad32 + bx_m + mi*16 + lane_div_16*4).
+            #
+            # `macro_kt * m_pad32 + bx_m` is uniform across the ENTIRE
+            # workgroup (doesn't depend on mi, a compile-time constant, or any
+            # per-lane value) -- hoist the readfirstlane out of the mi loop
+            # entirely instead of redundantly re-broadcasting it m_chunks
+            # times. `mi*16` is added afterward as a plain scalar op (still
+            # compile-time constant, no extra lane divergence).
+            a_uniform_base = rocdl.readfirstlane(T.i32, macro_kt * m_pad32 + bx_m)
             a_recip = []
             for mi in range_constexpr(m_chunks):
-                # Uniform (per-workgroup, not per-lane) part goes through
-                # readfirstlane to get a scalar SGPR base -- lane_div_16 is
-                # per-lane and must be added AFTER, like load_sc()'s sc_lane.
-                uniform_base = macro_kt * m_pad32 + bx_m + fx.Int32(mi * 16)
-                byte_off = rocdl.readfirstlane(T.i32, uniform_base) + lane_div_16 * fx.Int32(4)
+                byte_off = a_uniform_base + fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4)
                 word = Vec(
                     fly.copy_atom_call_ssa([T.vec(1, T.i32)], mbs_copy, mbs_a_flat[None, byte_off])
                 )[0]
@@ -297,12 +329,14 @@ def compile_mxfp4_gemm_mbs(
                     byte_ii = arith.andi(shifted, arith.constant(0xFF, type=T.i32))
                     recips.append(_byte_to_recip(byte_ii))
                 a_recip.append(recips)
-            # B: one byte per ni (column fixed per lane).
+            # B: one byte per ni (column fixed per lane). Same hoisting: the
+            # workgroup-uniform part goes through readfirstlane once, outside
+            # the ni loop; lane_mod_16 (per-lane) is added after.
             n_pad32 = (N + 31) // 32 * 32
+            b_uniform_base = rocdl.readfirstlane(T.i32, macro_kt * fx.Int32(n_pad32) + by_n + wave * fx.Int32(BN // 4))
             b_recip = []
             for ni in range_constexpr(num_acc_n):
-                col = by_n + wave * fx.Int32(BN // 4) + fx.Int32(ni * 16) + lane_mod_16
-                byte_off = macro_kt * fx.Int32(n_pad32) + col
+                byte_off = b_uniform_base + fx.Int32(ni * 16) + lane_mod_16
                 byte = Vec(fly.copy_atom_call_ssa([T.vec(1, T.i8)], mbs_b_copy, mbs_b_flat[None, byte_off]))[0]
                 byte_i32 = arith.extui(T.i32, _raw(byte))
                 b_recip.append(_byte_to_recip(byte_i32))
@@ -343,9 +377,73 @@ def compile_mxfp4_gemm_mbs(
                 accs[idx] = c_frags[idx].load().ir_value()
             return accs
 
+        # Scheduler hints: interleave the MFMAs with the vmem loads + A LDS
+        # read/writes -- copied unmodified from kernels/mxfp4_preshuffle.py.
+        def build_scheduler(numer, denom):
+            if const_expr(denom <= 0):
+                return []
+            if const_expr(numer <= 0):
+                return [0] * denom
+            out = []
+            prev = 0
+            for i in range_constexpr(denom):
+                cur = ((i + 1) * numer + (denom - 1)) // denom
+                out.append(cur - prev)
+                prev = cur
+            return out
+
+        def hot_loop_scheduler():
+            mfma_total = sched_mfma_total
+            dswr_tail = min(sched_num_a_dswr, mfma_total)
+            dsrd_preload_eff = min(int(dsrd_preload), sched_num_ds_load)
+            dvmem_preload_eff = min(int(dvmem_preload), sched_num_gmem)
+            vmem_remaining = sched_num_gmem - dvmem_preload_eff
+            dsrd_remaining = sched_num_ds_load - dsrd_preload_eff
+            if const_expr(0 < vmem_remaining < mfma_total):
+                vmem_schedule = build_scheduler(vmem_remaining, vmem_remaining) + [0] * (mfma_total - vmem_remaining)
+            else:
+                vmem_schedule = build_scheduler(vmem_remaining, mfma_total)
+            dsrd_schedule = build_scheduler(dsrd_remaining, mfma_total)
+            dswr_start = max(mfma_total - dswr_tail - 2, 0)
+            last_dsrd_mfma_idx = -1
+            for sched_idx in range_constexpr(mfma_total):
+                if const_expr(dsrd_schedule[sched_idx]):
+                    last_dsrd_mfma_idx = sched_idx
+            dswr_start = max(dswr_start, last_dsrd_mfma_idx + 1)
+            idx_ds_read = dsrd_preload_eff
+            idx_gmem_load = dvmem_preload_eff
+            idx_ds_write = 0
+            if const_expr(dvmem_preload_eff):
+                rocdl.sched_vmem(dvmem_preload_eff)
+            if const_expr(dsrd_preload_eff):
+                rocdl.sched_dsrd(dsrd_preload_eff)
+            for mfma_idx in range_constexpr(mfma_total):
+                rocdl.sched_mfma(1)
+                n_dsrd = dsrd_schedule[mfma_idx]
+                if const_expr(n_dsrd and (idx_ds_read < sched_num_ds_load)):
+                    if const_expr(idx_ds_read + n_dsrd > sched_num_ds_load):
+                        n_dsrd = sched_num_ds_load - idx_ds_read
+                    if const_expr(n_dsrd):
+                        rocdl.sched_dsrd(n_dsrd)
+                        idx_ds_read += n_dsrd
+                n_vmem = vmem_schedule[mfma_idx]
+                if const_expr(n_vmem and (idx_gmem_load < sched_num_gmem)):
+                    if const_expr(idx_gmem_load + n_vmem > sched_num_gmem):
+                        n_vmem = sched_num_gmem - idx_gmem_load
+                    if const_expr(n_vmem):
+                        rocdl.sched_vmem(n_vmem)
+                        idx_gmem_load += n_vmem
+                if const_expr((idx_ds_write < dswr_tail) and (mfma_idx >= dswr_start)):
+                    rocdl.sched_dswr(1)
+                    idx_ds_write += 1
+            if const_expr(idx_ds_write < sched_num_a_dswr):
+                rocdl.sched_dswr(sched_num_a_dswr - idx_ds_write)
+            rocdl.sched_barrier(0)
+
         accs_init = [Vec.filled(4, 0.0, Float32).ir_value() for _ in range_constexpr(n_acc)]
 
-        coop_load_a(fx.Int32(0), _iter_of(fx.Int32(0)))
+        dma_a_to_lds(fx.Int32(0), fx.Int32(0))
+        rocdl.s_waitcnt(0)
         gpu.barrier()
         for iv, state in range(fx.Index(0), fx.Index(K_TILES), fx.Index(1), init=accs_init):
             accs = list(state)
@@ -356,14 +454,17 @@ def compile_mxfp4_gemm_mbs(
             pf_kt = nkt - nkt // fx.Int32(K_TILES)
             chunk_kt = kt if tiles_per_chunk == 1 else kt // fx.Int32(tiles_per_chunk)
             scale_shift = None if tiles_per_chunk == 1 else (kt % fx.Int32(tiles_per_chunk)) * fx.Int32(16)
-            coop_load_a(pf_kt, _iter_of(nxt))
             av = read_a(cur)
             bv = load_b(kt)
             sa_v, sb_v = load_sc(chunk_kt)
             # This K-tile covers k_halves consecutive 128-K macro blocks,
             # starting at kt * k_halves.
             macro_recips = [load_mbs(kt * fx.Int32(k_halves) + fx.Int32(kh)) for kh in range_constexpr(k_halves)]
+            dma_a_to_lds(pf_kt, nxt)  # A DMA AFTER B/scale/mbs loads -> overlaps the MFMAs
             accs = compute_with_macro(accs, av, bv, sa_v, sb_v, macro_recips, scale_shift)
+            if const_expr(enable_scheduler):
+                hot_loop_scheduler()
+            rocdl.s_waitcnt(0)  # drain the A DMA before the barrier
             gpu.barrier()
             results = yield accs
         accs = results
