@@ -1,0 +1,12 @@
+
+=== Gaussian A  (M=256, N=8192, K=8192) ===
+  [baseline quant] kernel-vs-torch-dequant-ref: max_abs_err=1.0000 mean_rel_err=0.1314%
+  [OAS quant] kernel-vs-torch-dequant-ref: max_abs_err=1.0000 mean_rel_err=0.1355%
+  GEMM output QSNR vs true BF16 matmul: baseline=15.78 dB, OAS=16.07 dB (delta +0.30 dB)
+
+=== Outlier-heavy A  (M=256, N=8192, K=8192) ===
+  [baseline quant] kernel-vs-torch-dequant-ref: max_abs_err=3.7969 mean_rel_err=0.1389%
+  [OAS quant] kernel-vs-torch-dequant-ref: max_abs_err=3.7188 mean_rel_err=0.1396%
+  GEMM output QSNR vs true BF16 matmul: baseline=15.80 dB, OAS=16.12 dB (delta +0.32 dB)
+
+PASS: OAS quantization is a correct, zero-kernel-change drop-in; GEMM accuracy improves.

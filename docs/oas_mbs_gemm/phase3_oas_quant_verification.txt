@@ -1,0 +1,15 @@
+
+=== Gaussian  shape=(2048, 4096) ===
+baseline (per_1x32_f4_quant):      QSNR =  18.75 dB
+OAS (3-candidate search):          QSNR =  19.04 dB  (delta +0.29 dB)
+OAS + MBS-Static (macro_block=128): QSNR =  19.31 dB  (delta vs OAS +0.27 dB)
+
+=== Outlier-heavy (1% @ ~25x)  shape=(2048, 4096) ===
+baseline (per_1x32_f4_quant):      QSNR =  18.72 dB
+OAS (3-candidate search):          QSNR =  19.13 dB  (delta +0.41 dB)
+OAS + MBS-Static (macro_block=128): QSNR =  19.56 dB  (delta vs OAS +0.43 dB)
+
+=== Summary: does MBS help the outlier-heavy tensor more? ===
+Gaussian:      OAS->MBS delta = +0.27 dB
+Outlier-heavy: OAS->MBS delta = +0.43 dB
+PASS: all assertions held.

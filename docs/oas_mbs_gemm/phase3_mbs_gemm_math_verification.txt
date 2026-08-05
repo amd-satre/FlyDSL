@@ -1,0 +1,12 @@
+
+=== Gaussian A  (M=256, N=512, K=8192) ===
+  OAS only (no MBS):        QSNR =  16.05 dB
+  OAS + MBS on A only:      QSNR =  16.18 dB  (delta +0.14 dB)
+  OAS + MBS on A and B:     QSNR =  16.31 dB  (delta +0.27 dB)
+
+=== Outlier-heavy A  (M=256, N=512, K=8192) ===
+  OAS only (no MBS):        QSNR =  16.09 dB
+  OAS + MBS on A only:      QSNR =  16.28 dB  (delta +0.19 dB)
+  OAS + MBS on A and B:     QSNR =  16.41 dB  (delta +0.32 dB)
+
+PASS: per-128-K-macro-block accumulate/scale/merge algorithm improves real GEMM QSNR.
