@@ -39,6 +39,7 @@ logging.basicConfig(level=logging.INFO)
 if not torch.cuda.is_available():
     pytest.skip("CUDA/ROCm not available. Skipping GPU tests.", allow_module_level=True)
 
+
 def _run_torch_mbs_ref(a_q, b_q, scale_a, scale_b, m8_a, m8_b, dtype, macro_block):
     x = fp4_utils.mxfp4_to_f32(a_q) * fp4_utils.e8m0_to_f32(scale_a[: a_q.shape[0]].repeat_interleave(32, dim=1))
     w = fp4_utils.mxfp4_to_f32(b_q) * fp4_utils.e8m0_to_f32(scale_b[: b_q.shape[0]].repeat_interleave(32, dim=1))
@@ -135,4 +136,113 @@ def test_mxfp4_oas_mbs_gemm(out_dtype, M, N, K, tile_m, tile_n, tile_k, macro_bl
     assert mean_abs_err < 0.02 * ref_scale, (
         f"MBS kernel output diverges from torch MBS reference: "
         f"mean_abs_err={mean_abs_err:.4f} ({100 * mean_abs_err / ref_scale:.2f}% of ref mean abs)"
+    )
+
+
+def _quantize_operand(x, use_mbs, macro_block):
+    """Quantize one operand: OAS+MBS if use_mbs, else plain OAS (no MBS
+    pre-scaling -- must match the kernel's mbs_on_a/mbs_on_b=False path,
+    which applies no correction for this operand either)."""
+    if use_mbs:
+        q, sc, m8, _ = oas_mbs_quant.per_1x32_f4_quant_oas_mbs(x, macro_block=macro_block)
+        return q, sc, m8
+    q, sc, _ = oas_mbs_quant.per_1x32_f4_quant_oas(x)
+    m8 = torch.zeros(x.shape[0], x.shape[1] // macro_block, dtype=torch.uint8, device=x.device)
+    return q, sc, m8
+
+
+def _run_torch_mbs_ref_selective(a_q, b_q, scale_a, scale_b, m8_a, m8_b, mbs_on_a, mbs_on_b, dtype, macro_block):
+    x = fp4_utils.mxfp4_to_f32(a_q) * fp4_utils.e8m0_to_f32(scale_a[: a_q.shape[0]].repeat_interleave(32, dim=1))
+    w = fp4_utils.mxfp4_to_f32(b_q) * fp4_utils.e8m0_to_f32(scale_b[: b_q.shape[0]].repeat_interleave(32, dim=1))
+    M, K = x.shape
+    N, _ = w.shape
+    factor_a = (1.0 + m8_a.float() / 256.0) if mbs_on_a else torch.ones(M, K // macro_block, device=x.device)
+    factor_b = (1.0 + m8_b.float() / 256.0) if mbs_on_b else torch.ones(N, K // macro_block, device=w.device)
+    x = x.reshape(M, K // macro_block, macro_block)
+    w = w.reshape(N, K // macro_block, macro_block)
+    acc = torch.zeros(M, N, device=x.device, dtype=torch.float32)
+    for kb in range(K // macro_block):
+        local = torch.mm(x[:, kb, :], w[:, kb, :].T)
+        sigma = (1.0 / factor_a[:, kb]).unsqueeze(1) * (1.0 / factor_b[:, kb]).unsqueeze(0)
+        acc += local * sigma
+    return acc.to(dtype)
+
+
+@pytest.mark.parametrize("mbs_on_a, mbs_on_b", [(True, True), (False, True), (True, False)])
+@pytest.mark.parametrize(
+    "M, N, K, tile_m, tile_n, tile_k, macro_block",
+    [
+        (64, 128, 256, 64, 128, 256, 128),
+        (64, 128, 512, 64, 128, 256, 256),  # combined with the macro_block=256 structural rewrite
+        pytest.param(256, 8192, 8192, 64, 128, 256, 128, marks=pytest.mark.large_shape),
+    ],
+)
+def test_mxfp4_oas_mbs_gemm_selective_operand(mbs_on_a, mbs_on_b, M, N, K, tile_m, tile_n, tile_k, macro_block):
+    """Selective per-operand MBS (docs/oas_mbs_gemm/PHASE4_STRUCTURAL_REWRITE.md):
+    when only one operand needs the correction, the other is quantized with
+    plain OAS (no MBS pre-scaling) and the kernel's sigma construction
+    collapses to a single side's reciprocal directly (no product needed) --
+    roughly halving the per-output-element correction cost on top of
+    whatever macro_block already saves."""
+    if get_rocm_arch() != "gfx950":
+        pytest.skip(f"MXFP4 OAS+MBS GEMM requires gfx950, got {get_rocm_arch()}")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    M32, N32 = (M + 31) // 32 * 32, (N + 31) // 32 * 32
+
+    a_fp32 = torch.zeros(M32, K, device=device, dtype=torch.float32)
+    b_fp32 = torch.zeros(N32, K, device=device, dtype=torch.float32)
+    a_fp32[:M] = torch.randn(M, K, device=device)
+    b_fp32[:N] = torch.randn(N, K, device=device)
+
+    a_q, scale_a, m8_a = _quantize_operand(a_fp32, mbs_on_a, macro_block)
+    a_q = a_q[:M]
+    b_q, scale_b, m8_b = _quantize_operand(b_fp32, mbs_on_b, macro_block)
+    b_q = b_q[:N]
+
+    c_ref = _run_torch_mbs_ref_selective(
+        a_q, b_q, scale_a, scale_b, m8_a[:M], m8_b[:N], mbs_on_a, mbs_on_b, torch.float32, macro_block
+    )
+
+    b_shuffled = fp4_utils.shuffle_weight_w4(b_q, 16, False, False)
+    scale_a_shuf = fp4_utils.shuffle_scale_w4(scale_a, 1, False)
+    scale_b_shuf = fp4_utils.shuffle_scale_w4(scale_b, 1, False)
+    mbs_a_k = oas_mbs_quant.shuffle_mbs_scale_w4(m8_a, M32).to(device)
+    mbs_b_k = oas_mbs_quant.shuffle_mbs_scale_w4(m8_b, N32).to(device)
+
+    c_out = torch.zeros((M, N), dtype=torch.bfloat16, device=device)
+    dummy_bias = torch.empty(0, dtype=torch.bfloat16, device=device)
+
+    def _to_bytes(t):
+        return t if t.dtype in (torch.uint8, torch.int8) else t.view(torch.uint8)
+
+    args = (
+        c_out.contiguous().view(-1),
+        _to_bytes(a_q).contiguous().view(-1),
+        _to_bytes(b_shuffled).contiguous().view(-1),
+        _to_bytes(scale_a_shuf).contiguous().view(-1),
+        _to_bytes(scale_b_shuf).contiguous().view(-1),
+        _to_bytes(mbs_a_k).contiguous().view(-1),
+        _to_bytes(mbs_b_k).contiguous().view(-1),
+        dummy_bias,
+        M,
+        N,
+        torch.cuda.current_stream(),
+    )
+    launch_fn = compile_mxfp4_gemm_mbs(
+        N=N, K=K, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, out_dtype="bf16",
+        macro_block=macro_block, mbs_on_a=mbs_on_a, mbs_on_b=mbs_on_b,
+    )
+    compiled_fn = flyc.compile(launch_fn, *args)
+    compiled_fn(*args)
+    torch.cuda.synchronize()
+
+    c_out_f32 = c_out.to(torch.float32)
+    mean_abs_err = (c_out_f32 - c_ref).abs().mean().item()
+    ref_scale = c_ref.abs().mean().item()
+    assert mean_abs_err < 0.02 * ref_scale, (
+        f"Selective-operand MBS kernel diverges from torch reference "
+        f"(mbs_on_a={mbs_on_a}, mbs_on_b={mbs_on_b}): mean_abs_err={mean_abs_err:.4f} "
+        f"({100 * mean_abs_err / ref_scale:.2f}% of ref mean abs)"
     )

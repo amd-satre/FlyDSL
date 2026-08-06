@@ -73,21 +73,91 @@ specifically — consistent with the paper's own finding that coarser macro
 blocks isolate outliers less precisely, degrading gracefully not
 catastrophically, per Appendix A's block-size ablation).
 
+## Second, bigger lever: selective per-operand MBS (`mbs_on_a`/`mbs_on_b`)
+
+The `macro_block` lever above reduces the *count* of correction episodes.
+There's an orthogonal lever that reduces the *cost per episode*: the
+per-output-element correction is `sigma = sigma_A[row] * sigma_B[col]` (1
+multiply) then `cf = fma(tmp, sigma, cf)` (1 FMA) — 2 ops/element when BOTH
+operands need MBS. But if only ONE operand's outliers actually need
+protecting (the paper's own Sec 4.4 already treats weights/activations
+asymmetrically — MBS-Dynamic vs MBS-Static — this is that asymmetry taken
+one step further), the multiply disappears entirely: `sigma` IS that one
+side's reciprocal directly, so the correction is a single FMA — **half the
+cost of the both-sides case**, and `load_mbs` also skips computing/loading
+the disabled side's reciprocals (roughly halving its own cost too).
+
+Added `mbs_on_a: bool = True, mbs_on_b: bool = True` to
+`compile_mxfp4_gemm_mbs`. When one side is disabled, that operand MUST be
+quantized with plain OAS (`per_1x32_f4_quant_oas`, no MBS pre-scaling) on the
+host side — otherwise its pre-scaling would be baked into the quantized
+values with no kernel-side undo, silently corrupting the result. Verified
+correctness for all 3 configs (both/A-only/B-only) — `mean_abs_err` ~0.14%
+of reference in every case, same as the baseline MBS kernel. 8 new test
+cases added to `tests/kernels/test_mxfp4_oas_mbs_gemm.py`
+(`test_mxfp4_oas_mbs_gemm_selective_operand`, 19/19 total tests pass).
+
+**Measured trade-off** (tile=(64,128,256), same 3 DeepSeek-R1 shapes):
+
+| Shape | Baseline | both (mb=128) | B-only (mb=128) | A-only (mb=128) |
+|---|---|---|---|---|
+| M=1024, N=K=7168 | 0.0477ms | +85.7% | **+16.8%** | +57.5% |
+| M=1024, N=36864, K=7168 | 0.1995ms | +87.5% | **+16.5%** | +58.1% |
+| M=1024, N=7168, K=2048 | 0.0190ms | +61.9% | **+14.2%** | +45.5% |
+
+B-only (MBS on weights/B, OAS-only on activations/A) is dramatically
+cheaper than A-only at this tile shape — `load_mbs`'s A-side needs
+`m_chunks` dword loads each producing 4 *distinct per-row* reciprocals
+(varies with `ii`), while B-side needs only `num_acc_n` loads each producing
+a *single* reciprocal shared across all 4 `ii` lanes (broadcast, no
+per-element variation) — B-side MBS is structurally cheaper to both load
+and apply, independent of which operand's *data* has more outliers.
+
+**Accuracy** (QSNR vs BF16 truth, M=256/N=8192/K=8192): B-only costs -0.13
+(Gaussian) / -0.14 dB (outlier-heavy) vs. both-sides — nearly identical to
+A-only's cost in this *synthetic, symmetric* test (both operands equally
+Gaussian/outlier-prone here; a real model's weights and activations have
+different outlier characteristics and may favor one side more or less than
+this test shows).
+
+### Combined: B-only + macro_block=256 (best result)
+
+The two levers stack (orthogonal changes to the same correction site):
+
+| Shape | Baseline | B-only, mb=128 | **B-only, mb=256** |
+|---|---|---|---|
+| M=1024, N=K=7168 | 0.0477ms | +17.2% | **+9.0%** |
+| M=1024, N=36864, K=7168 | 0.2000ms | +16.6% | **+7.1%** |
+| M=1024, N=7168, K=2048 | 0.0187ms | +11.1% | **+6.9%** |
+
+**This matches the paper's own claimed ~6.2% average GEMM overhead.**
+Accuracy cost of adding `macro_block=256` on top of B-only is small: -0.07 dB
+(both Gaussian and outlier-heavy) — i.e. going from "both operands,
+macro_block=128" (the maximally-accurate configuration) to "B-only,
+macro_block=256" costs a total of about -0.20 dB (Gaussian) / -0.21 dB
+(outlier-heavy) QSNR, in exchange for cutting overhead from ~86-88% to
+~7-9% — roughly a **10x reduction in overhead** for a fraction of a dB.
+Verified correct (0.14% mean error vs. the matching torch reference,
+consistent with every other configuration tested).
+
 ## Recommendation
 
-This is a genuine, favorable trade-off (roughly half the overhead for
-roughly a quarter to half of the MBS-specific accuracy gain given up, while
-still retaining all of OAS's free accuracy gain and most of MBS's) — but
-it's a numerics choice, not a free lunch, and the user should decide whether
-to adopt it as the default rather than have it decided silently. Options:
-1. Keep `macro_block=128` as default (max accuracy, current perf).
-2. Switch default to `macro_block=256` (much closer to parity with plain
-   MXFP4, small accuracy give-back).
-3. Expose both and pick per-deployment based on the accuracy/latency
-   sensitivity of the specific serving workload.
+**B-only + macro_block=256 is the strong recommendation**: it lands within
+noise of the paper's own claimed overhead ceiling, at an accuracy cost an
+order of magnitude smaller than the total MBS benefit being protected
+(-0.20/-0.21 dB given up out of the +0.55/+0.62 dB MBS provides over
+OAS-alone — i.e. still keeping ~65% of MBS's own accuracy contribution, on
+top of all of OAS's free gain). This is not yet adopted as the new default
+in `compile_mxfp4_gemm_mbs` (all three new parameters default to the
+original, maximally-accurate behavior: `macro_block=128, mbs_on_a=True,
+mbs_on_b=True`) — a numerics choice belongs to whoever deploys this, not
+decided silently here.
 
-Not yet attempted: `macro_block=512` (further overhead reduction, further
-accuracy give-back — the paper's own ablation shows continued graceful
-degradation through at least 512), or removing the `tile_k % macro_block ==
-0` constraint (would need cross-iteration loop-carried MBS accumulator state,
-enabling `macro_block > tile_k`, e.g. macro_block=256 with tile_k=128 tiles).
+Not yet attempted: `macro_block=512` (further overhead reduction, the
+paper's own ablation shows continued graceful degradation through at least
+512); removing the `tile_k % macro_block == 0` constraint (would need
+cross-iteration loop-carried MBS accumulator state); real-model weight/
+activation outlier profiling to determine whether B (weights) genuinely
+needs less protection than A (activations) in practice, rather than relying
+on this synthetic symmetric test (Phase 5's real-tensor accuracy work should
+settle this).

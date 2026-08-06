@@ -57,6 +57,8 @@ def compile_mxfp4_gemm_mbs(
     tile_k: int,
     out_dtype: str = "bf16",
     macro_block: int = 128,
+    mbs_on_a: bool = True,
+    mbs_on_b: bool = True,
 ):
     """MXFP4 preshuffle GEMM with OAS+MBS -- correctness-first, unscheduled.
 
@@ -77,6 +79,21 @@ def compile_mxfp4_gemm_mbs(
     accuracy degrades gracefully, not catastrophically, as macro_block grows).
     This is a genuine numerics trade-off, not free -- see
     docs/oas_mbs_gemm/PHASE4_STRUCTURAL_REWRITE.md for the measured trade-off.
+
+    ``mbs_on_a``/``mbs_on_b`` (both default True): apply MBS to that operand
+    at all. The per-output-element correction is sigma = sigma_A * sigma_B
+    (1 multiply) then cf = fma(tmp, sigma, cf) (1 FMA) -- 2 ops/element. If
+    only ONE side needs MBS (the other just uses OAS, which is free -- it's
+    only a smarter choice of the already-native E8M0 scale, no kernel-side
+    correction at all), the multiply is eliminated entirely: sigma IS the one
+    active side's recip directly, so it's a single FMA (1 op/element, HALF
+    the cost). load_mbs also skips computing/loading the disabled side's
+    reciprocals entirely (roughly halving load_mbs's own cost too). This is
+    the paper's own precedent (Sec 4.4 already treats weights/activations
+    asymmetrically -- MBS-Dynamic vs MBS-Static) taken one step further: skip
+    MBS on whichever operand needs it least. See
+    docs/oas_mbs_gemm/PHASE4_STRUCTURAL_REWRITE.md for the measured trade-off
+    (this is orthogonal to and stacks with ``macro_block``).
     """
     BM, BN, BK = tile_m, tile_n, tile_k
     if BK not in (128, 256) or K % BK != 0:
@@ -369,23 +386,34 @@ def compile_mxfp4_gemm_mbs(
             # entirely instead of redundantly re-broadcasting it m_chunks
             # times. `mi*16` is added afterward as a plain scalar op (still
             # compile-time constant, no extra lane divergence).
-            a_uniform_base = rocdl.readfirstlane(T.i32, macro_kt * m_pad32 + bx_m)
-            a_recip = []
-            for mi in range_constexpr(m_chunks):
-                byte_off = a_uniform_base + fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4)
-                word = Vec(
-                    fly.copy_atom_call_ssa([T.vec(1, T.i32)], mbs_copy, mbs_a_flat[None, byte_off])
-                )[0]
-                w = _raw(word)
-                recips = []
-                for ii in range_constexpr(4):
-                    shifted = arith.shrui(w, arith.constant(ii * 8, type=T.i32))
-                    byte_ii = arith.andi(shifted, arith.constant(0xFF, type=T.i32))
-                    recips.append(_byte_to_recip(byte_ii))
-                a_recip.append(recips)
+            #
+            # When mbs_on_a is False, skip this side's loads/reciprocals
+            # entirely (const_expr -- resolved at trace time, no runtime
+            # branch): the disabled side contributes a constant identity
+            # factor, and compute_with_macro's sigma construction (below)
+            # never even references a_recip in that case.
+            a_recip = None
+            if const_expr(mbs_on_a):
+                a_uniform_base = rocdl.readfirstlane(T.i32, macro_kt * m_pad32 + bx_m)
+                a_recip = []
+                for mi in range_constexpr(m_chunks):
+                    byte_off = a_uniform_base + fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4)
+                    word = Vec(
+                        fly.copy_atom_call_ssa([T.vec(1, T.i32)], mbs_copy, mbs_a_flat[None, byte_off])
+                    )[0]
+                    w = _raw(word)
+                    recips = []
+                    for ii in range_constexpr(4):
+                        shifted = arith.shrui(w, arith.constant(ii * 8, type=T.i32))
+                        byte_ii = arith.andi(shifted, arith.constant(0xFF, type=T.i32))
+                        recips.append(_byte_to_recip(byte_ii))
+                    a_recip.append(recips)
             # B: one byte per ni (column fixed per lane). Same hoisting: the
             # workgroup-uniform part goes through readfirstlane once, outside
-            # the ni loop; lane_mod_16 (per-lane) is added after.
+            # the ni loop; lane_mod_16 (per-lane) is added after. Same
+            # mbs_on_b skip as above.
+            if const_expr(not mbs_on_b):
+                return a_recip, None
             n_pad32 = (N + 31) // 32 * 32
             b_uniform_base = rocdl.readfirstlane(T.i32, macro_kt * fx.Int32(n_pad32) + by_n + wave * fx.Int32(BN // 4))
             b_recip = []
@@ -440,9 +468,29 @@ def compile_mxfp4_gemm_mbs(
                                 scale_a=sa_v[mp_i],
                                 scale_b=sb_v[np_i],
                             )
-                        sigma = Vec.from_elements(
-                            [_raw(a_recip[mi][ii] * b_recip[ni]) for ii in range_constexpr(4)], Float32
-                        )
+                        # sigma construction depends on which side(s) are
+                        # active (const_expr -- resolved at trace time, zero
+                        # runtime cost for the inactive branches):
+                        #  - both:   sigma[ii] = a_recip[mi][ii] * b_recip[ni]  (1 mul/ii, as before)
+                        #  - B only: sigma[ii] = b_recip[ni]                    (broadcast, 0 muls)
+                        #  - A only: sigma[ii] = a_recip[mi][ii]                (already per-ii, 0 muls)
+                        # Eliminating the multiply is the whole point: with
+                        # only one side active, the correction is a SINGLE
+                        # value (or a direct per-ii value), so cf = fma(tmp,
+                        # sigma, cf) below is the only op needed -- half the
+                        # per-output-element cost of the both-sides case.
+                        if const_expr(mbs_on_a and mbs_on_b):
+                            sigma = Vec.from_elements(
+                                [_raw(a_recip[mi][ii] * b_recip[ni]) for ii in range_constexpr(4)], Float32
+                            )
+                        elif const_expr(mbs_on_b):
+                            sigma = Vec.from_elements([_raw(b_recip[ni]) for _ in range_constexpr(4)], Float32)
+                        elif const_expr(mbs_on_a):
+                            sigma = Vec.from_elements(
+                                [_raw(a_recip[mi][ii]) for ii in range_constexpr(4)], Float32
+                            )
+                        else:
+                            sigma = Vec.filled(4, 1.0, Float32)
                         # Fused multiply-add: cf_new = tmp*sigma + cf in one
                         # MLIR math.fma op (4x v_fma_f32 on-device) instead of
                         # a separate vector multiply (4x v_mul_f32) followed
