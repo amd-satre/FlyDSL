@@ -90,18 +90,45 @@ def compile_mxfp4_gemm_mbs(
     n_pairs = max(1, num_acc_n // 2)
     m_pairs = max(1, m_chunks // 2)
 
+    # Occupancy hint (rocdl.waves_per_eu), mirroring kernels/mxfp4_preshuffle.py's
+    # value_attrs mechanism. compile_mxfp4_gemm_mbs has no waves_per_eu kwarg (the
+    # task_runner call site is frozen), so the value is derived internally purely
+    # from tile_m/tile_n/tile_k -- only the 3 (tile_m,tile_n,tile_k) configs that
+    # appear across TEST_SHAPES are keyed; anything else falls back to None (no
+    # hint, i.e. compiler auto-picked occupancy, identical to prior behavior).
+    _MBS_WAVES_PER_EU = {
+        (32, 128, 256): None,
+        (64, 128, 256): None,
+        (128, 256, 128): 1,
+    }
+    waves_per_eu = _MBS_WAVES_PER_EU.get((BM, BN, BK), None)
+
     # MBS: macro-block index granularity is 128 (matches one 16x16x128 MFMA
     # call). M/N padded to 32 like the existing e8m0 scale bound.
     K_MACRO = K // 128
 
     # Scheduler counts (sched_group_barrier interleave), per loop iter --
-    # copied unmodified from kernels/mxfp4_preshuffle.py's fp4 (non-fp6) path.
+    # base counts copied unmodified from kernels/mxfp4_preshuffle.py's fp4
+    # (non-fp6) path (A coop + B + scales). Extended below to also cover
+    # load_mbs's own gmem loads (A-side dword loads: one per m_chunks, B-side
+    # byte loads: one per num_acc_n, each issued once per k_halves macro
+    # block per K-tile iteration) -- these were previously NOT counted here,
+    # so hot_loop_scheduler's vmem interleave budget didn't know about them
+    # and they weren't spread across the MFMA issue stream by build_scheduler/
+    # vmem_schedule (see module docstring + DIRECTION r1_d1). This is a pure
+    # bookkeeping/count fix; load_mbs's call site and internals are untouched.
     sched_mfma_total = k_halves * m_chunks * num_acc_n
     sched_num_ds_load = m_chunks * k_halves  # A LDS reads/thread (read_a)
-    sched_num_gmem = n_coop + num_acc_n * k_halves + m_pairs + n_pairs  # A coop + B + scales
+    sched_num_gmem_base = n_coop + num_acc_n * k_halves + m_pairs + n_pairs  # A coop + B + scales (orig)
+    sched_num_gmem_mbs = (m_chunks + num_acc_n) * k_halves  # load_mbs: A dword + B byte loads, per macro block
+    sched_num_gmem = sched_num_gmem_base + sched_num_gmem_mbs  # A coop + B + scales + MBS
     sched_num_a_dswr = 0  # async copy -> no explicit A LDS writes to schedule
     enable_scheduler = num_acc_n <= 2 or True  # always async-copy here, like use_async_copy=True upstream
     dsrd_preload = sched_num_ds_load
+    # Preload ALL vmem loads (A coop + B + scales + MBS) up front, same
+    # preload-everything relationship as the original code (dvmem_preload ==
+    # sched_num_gmem) -- measured to beat splitting MBS loads into the
+    # per-mfma interleave budget (that variant regressed the small-M cases).
     dvmem_preload = sched_num_gmem
 
     @fx.struct
@@ -520,6 +547,7 @@ def compile_mxfp4_gemm_mbs(
             arg_bias,
             i32_m,
             i32_n,
+            value_attrs={"rocdl.waves_per_eu": waves_per_eu},
         ).launch(grid=(gx, gy, 1), block=(256, 1, 1), stream=stream)
 
     return launch_gemm
