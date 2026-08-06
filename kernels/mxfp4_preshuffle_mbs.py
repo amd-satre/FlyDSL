@@ -370,6 +370,15 @@ def compile_mxfp4_gemm_mbs(
             return a_recip, b_recip
 
         def compute_with_macro(accs, av, bv, sa_v, sb_v, macro_recips, scale_shift):
+            # Local import: keeps this edit scoped to compute_with_macro (the
+            # assigned focus region) instead of touching the file's top-level
+            # import list. `_math_fma` is the MLIR `math.fma` op binding --
+            # same idiom already used in kernels/moe_gemm_2stage.py's
+            # `_acc_scaled_f32` helper ("MFMA f32 partial -> scale -> add to
+            # f32 accumulator via math.fma on vector") for an
+            # identical scale-then-accumulate-into-fp32 pattern.
+            from flydsl._mlir.dialects._math_ops_gen import fma as _math_fma
+
             if const_expr(scale_shift is not None):
                 sh = _raw(scale_shift)
                 sa_v = [arith.shrui(_raw(v), sh) for v in sa_v]
@@ -398,7 +407,17 @@ def compile_mxfp4_gemm_mbs(
                         sigma = Vec.from_elements(
                             [_raw(a_recip[mi][ii] * b_recip[ni]) for ii in range_constexpr(4)], Float32
                         )
-                        cf_new = Vec(cf.load()) + Vec(tmp.load()) * sigma
+                        # Fused multiply-add: cf_new = tmp*sigma + cf in one
+                        # MLIR math.fma op (4x v_fma_f32 on-device) instead of
+                        # a separate vector multiply (4x v_mul_f32) followed
+                        # by a separate vector add (4x v_add_f32). Same
+                        # post-dot-product scale-then-accumulate evaluation
+                        # order/result as before (paper's Sec 4.3.2 boundary
+                        # is unchanged: sigma is still applied to the raw
+                        # per-macro-block MFMA partial, still before merging
+                        # into the running total) -- only the multiply+add is
+                        # fused into a single hardware instruction.
+                        cf_new = Vec(_math_fma(_raw(tmp.load()), _raw(sigma), _raw(cf.load())))
                         cf.store(cf_new)
             for idx in range_constexpr(n_acc):
                 accs[idx] = c_frags[idx].load().ir_value()

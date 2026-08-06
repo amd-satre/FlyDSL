@@ -49,8 +49,9 @@ def _delegate_to_docker(mode):
     sys.exit(proc.returncode)
 
 
-sys.path.insert(0, TASK_DIR)
 sys.path.insert(0, FLYDSL_ROOT)  # for the `flydsl` package itself (built extensions)
+sys.path.insert(0, TASK_DIR)  # LAST insert wins position 0: must resolve `kernels.*`/`tests.*`
+# to TASK_DIR's own (possibly-edited) copies, not shadow them with FLYDSL_ROOT's shared ones.
 os.chdir(TASK_DIR)
 
 TASK_NAME = "flydsl/mxfp4_oas_mbs_gemm"
