@@ -39,20 +39,17 @@ logging.basicConfig(level=logging.INFO)
 if not torch.cuda.is_available():
     pytest.skip("CUDA/ROCm not available. Skipping GPU tests.", allow_module_level=True)
 
-MACRO_BLOCK = 128
-
-
-def _run_torch_mbs_ref(a_q, b_q, scale_a, scale_b, m8_a, m8_b, dtype):
+def _run_torch_mbs_ref(a_q, b_q, scale_a, scale_b, m8_a, m8_b, dtype, macro_block):
     x = fp4_utils.mxfp4_to_f32(a_q) * fp4_utils.e8m0_to_f32(scale_a[: a_q.shape[0]].repeat_interleave(32, dim=1))
     w = fp4_utils.mxfp4_to_f32(b_q) * fp4_utils.e8m0_to_f32(scale_b[: b_q.shape[0]].repeat_interleave(32, dim=1))
     M, K = x.shape
     N, _ = w.shape
     factor_a = 1.0 + m8_a.float() / 256.0
     factor_b = 1.0 + m8_b.float() / 256.0
-    x = x.reshape(M, K // MACRO_BLOCK, MACRO_BLOCK)
-    w = w.reshape(N, K // MACRO_BLOCK, MACRO_BLOCK)
+    x = x.reshape(M, K // macro_block, macro_block)
+    w = w.reshape(N, K // macro_block, macro_block)
     acc = torch.zeros(M, N, device=x.device, dtype=torch.float32)
-    for kb in range(K // MACRO_BLOCK):
+    for kb in range(K // macro_block):
         local = torch.mm(x[:, kb, :], w[:, kb, :].T)
         sigma = (1.0 / factor_a[:, kb]).unsqueeze(1) * (1.0 / factor_b[:, kb]).unsqueeze(0)
         acc += local * sigma
@@ -61,16 +58,22 @@ def _run_torch_mbs_ref(a_q, b_q, scale_a, scale_b, m8_a, m8_b, dtype):
 
 @pytest.mark.parametrize("out_dtype", ["bf16", "fp16"])
 @pytest.mark.parametrize(
-    "M, N, K, tile_m, tile_n, tile_k",
+    "M, N, K, tile_m, tile_n, tile_k, macro_block",
     [
-        (64, 128, 256, 64, 128, 256),  # smallest: K_TILES=1, k_halves=2
-        (64, 8192, 8192, 64, 128, 128),  # production scale: k_halves=1
-        pytest.param(256, 8192, 8192, 64, 128, 256, marks=pytest.mark.large_shape),  # k_halves=2, multi K-tile
+        (64, 128, 256, 64, 128, 256, 128),  # smallest: K_TILES=1, k_halves=2
+        (64, 8192, 8192, 64, 128, 128, 128),  # production scale: k_halves=1
+        pytest.param(256, 8192, 8192, 64, 128, 256, 128, marks=pytest.mark.large_shape),  # k_halves=2, multi K-tile
+        # macro_block=256 structural variant (docs/oas_mbs_gemm/PHASE4_STRUCTURAL_REWRITE.md):
+        # groups 2 native 128-K MFMA calls under one coarser correction. Requires
+        # tile_k % macro_block == 0, so tile_k=256 here (n_group=2, n_groups=1/tile).
+        (64, 128, 512, 64, 128, 256, 256),  # smallest for macro_block=256: n_groups=1 per K-tile
+        pytest.param(256, 8192, 8192, 64, 128, 256, 256, marks=pytest.mark.large_shape),
     ],
 )
-def test_mxfp4_oas_mbs_gemm(out_dtype, M, N, K, tile_m, tile_n, tile_k):
+def test_mxfp4_oas_mbs_gemm(out_dtype, M, N, K, tile_m, tile_n, tile_k, macro_block):
     """OAS+MBS MXFP4 GEMM matches the pure-PyTorch MBS simulation at
-    bf16-level tolerance, on gfx950."""
+    bf16-level tolerance, on gfx950, at both macro_block=128 (default) and
+    macro_block=256 (structural rewrite, see PHASE4_STRUCTURAL_REWRITE.md)."""
     if get_rocm_arch() != "gfx950":
         pytest.skip(f"MXFP4 OAS+MBS GEMM requires gfx950, got {get_rocm_arch()}")
 
@@ -83,12 +86,12 @@ def test_mxfp4_oas_mbs_gemm(out_dtype, M, N, K, tile_m, tile_n, tile_k):
     a_fp32[:M] = torch.randn(M, K, device=device)
     b_fp32[:N] = torch.randn(N, K, device=device)
 
-    a_q, scale_a, m8_a, _ = oas_mbs_quant.per_1x32_f4_quant_oas_mbs(a_fp32, macro_block=MACRO_BLOCK)
+    a_q, scale_a, m8_a, _ = oas_mbs_quant.per_1x32_f4_quant_oas_mbs(a_fp32, macro_block=macro_block)
     a_q = a_q[:M]
-    b_q, scale_b, m8_b, _ = oas_mbs_quant.per_1x32_f4_quant_oas_mbs(b_fp32, macro_block=MACRO_BLOCK)
+    b_q, scale_b, m8_b, _ = oas_mbs_quant.per_1x32_f4_quant_oas_mbs(b_fp32, macro_block=macro_block)
     b_q = b_q[:N]
 
-    c_ref = _run_torch_mbs_ref(a_q, b_q, scale_a, scale_b, m8_a[:M], m8_b[:N], torch.float32)
+    c_ref = _run_torch_mbs_ref(a_q, b_q, scale_a, scale_b, m8_a[:M], m8_b[:N], torch.float32, macro_block)
 
     b_shuffled = fp4_utils.shuffle_weight_w4(b_q, 16, False, False)
     scale_a_shuf = fp4_utils.shuffle_scale_w4(scale_a, 1, False)
@@ -118,7 +121,9 @@ def test_mxfp4_oas_mbs_gemm(out_dtype, M, N, K, tile_m, tile_n, tile_k):
             torch.cuda.current_stream(),
         )
 
-    launch_fn = compile_mxfp4_gemm_mbs(N=N, K=K, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, out_dtype=out_dtype)
+    launch_fn = compile_mxfp4_gemm_mbs(
+        N=N, K=K, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, out_dtype=out_dtype, macro_block=macro_block
+    )
     args = _args(c_out, a_q, b_shuffled, scale_a_shuf, scale_b_shuf, mbs_a_k, mbs_b_k)
     compiled_fn = flyc.compile(launch_fn, *args)
     compiled_fn(*args)

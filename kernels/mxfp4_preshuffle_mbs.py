@@ -56,18 +56,40 @@ def compile_mxfp4_gemm_mbs(
     tile_n: int,
     tile_k: int,
     out_dtype: str = "bf16",
+    macro_block: int = 128,
 ):
     """MXFP4 preshuffle GEMM with OAS+MBS -- correctness-first, unscheduled.
 
     Returns fn(C, A, B, scale_a, scale_b, mbs_a, mbs_b, bias, M, N, stream).
     A: MXFP4 (E2M1), 2 codes/byte. B: CK-preshuffled MXFP4. scale_a/scale_b:
-    e8m0 (per-32). mbs_a/mbs_b: uint8 mantissa, transposed [K/128, M or N].
+    e8m0 (per-32). mbs_a/mbs_b: uint8 mantissa, transposed [K/macro_block, M or N].
+
+    ``macro_block``: MBS macro-block size in K-elements (default 128, matching
+    this hardware's native 16x16x128 scaled-MFMA granularity 1:1 -- one MFMA
+    call, one correction). Must be a multiple of 128 (so it aligns to whole
+    MFMA calls) and ``tile_k`` must be a multiple of it (so a macro block's
+    worth of MFMA calls always completes within a single outer K-tile loop
+    iteration -- no cross-iteration loop-carried accumulator needed). Setting
+    ``macro_block=256`` groups 2 consecutive 128-K MFMA calls under ONE
+    Hadamard correction instead of one each, roughly halving the correction
+    arithmetic's instruction count at the cost of coarser per-128-K outlier
+    isolation (see arXiv:2603.08713 Appendix A's own block-size ablation --
+    accuracy degrades gracefully, not catastrophically, as macro_block grows).
+    This is a genuine numerics trade-off, not free -- see
+    docs/oas_mbs_gemm/PHASE4_STRUCTURAL_REWRITE.md for the measured trade-off.
     """
     BM, BN, BK = tile_m, tile_n, tile_k
     if BK not in (128, 256) or K % BK != 0:
         raise ValueError(f"tile_k must be 128 or 256 dividing K; got tile_k={BK}, K={K}")
     if K % 256 != 0:
         raise ValueError(f"K must be a multiple of 256 (e8m0 scale chunk); got K={K}")
+    if macro_block % 128 != 0:
+        raise ValueError(f"macro_block must be a multiple of 128; got {macro_block}")
+    if BK % macro_block != 0:
+        raise ValueError(
+            f"tile_k must be a multiple of macro_block (no cross-iteration MBS accumulator "
+            f"support); got tile_k={BK}, macro_block={macro_block}"
+        )
     out_elem = BFloat16 if out_dtype == "bf16" else Float16
 
     a_row_bytes = K // 2
@@ -103,9 +125,14 @@ def compile_mxfp4_gemm_mbs(
     }
     waves_per_eu = _MBS_WAVES_PER_EU.get((BM, BN, BK), None)
 
-    # MBS: macro-block index granularity is 128 (matches one 16x16x128 MFMA
-    # call). M/N padded to 32 like the existing e8m0 scale bound.
-    K_MACRO = K // 128
+    # MBS: macro-block index granularity is `macro_block` K-elements.
+    # n_group = how many consecutive native 128-K MFMA calls (kh's) share ONE
+    # Hadamard correction; n_groups = how many such groups exist per outer
+    # K-tile iteration (BK % macro_block == 0 guarantees this is exact, no
+    # remainder). M/N padded to 32 like the existing e8m0 scale bound.
+    n_group = macro_block // 128
+    n_groups = k_halves // n_group
+    K_MACRO = K // macro_block
 
     # Scheduler counts (sched_group_barrier interleave), per loop iter --
     # base counts copied unmodified from kernels/mxfp4_preshuffle.py's fp4
@@ -386,8 +413,8 @@ def compile_mxfp4_gemm_mbs(
             c_frags = [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(n_acc)]
             for idx in range_constexpr(n_acc):
                 c_frags[idx].store(Vec(accs[idx]))
-            for kh in range_constexpr(k_halves):
-                a_recip, b_recip = macro_recips[kh]
+            for group in range_constexpr(n_groups):
+                a_recip, b_recip = macro_recips[group]
                 for ni in range_constexpr(num_acc_n):
                     np_i, in_b = ni // 2, ni % 2
                     for mi in range_constexpr(m_chunks):
@@ -395,15 +422,24 @@ def compile_mxfp4_gemm_mbs(
                         cf = c_frags[mi * num_acc_n + ni]
                         tmp = fx.make_rmem_tensor(4, Float32)
                         tmp.store(Vec.filled(4, 0.0, Float32))
-                        fx.gemm(
-                            scale_atoms[(kh * 2 + im, kh * 2 + in_b)],
-                            tmp,
-                            av[mi * k_halves + kh],
-                            bv[ni * k_halves + kh],
-                            tmp,
-                            scale_a=sa_v[mp_i],
-                            scale_b=sb_v[np_i],
-                        )
+                        # Accumulate all n_group native 128-K MFMA calls that
+                        # make up this macro block into the SAME local `tmp`
+                        # (zero-initialized once, above) before applying any
+                        # correction -- this is the structural change from
+                        # macro_block=128 (n_group=1, identical to before):
+                        # one Hadamard correction now covers n_group calls
+                        # instead of exactly one.
+                        for g_kh in range_constexpr(n_group):
+                            kh = group * n_group + g_kh
+                            fx.gemm(
+                                scale_atoms[(kh * 2 + im, kh * 2 + in_b)],
+                                tmp,
+                                av[mi * k_halves + kh],
+                                bv[ni * k_halves + kh],
+                                tmp,
+                                scale_a=sa_v[mp_i],
+                                scale_b=sb_v[np_i],
+                            )
                         sigma = Vec.from_elements(
                             [_raw(a_recip[mi][ii] * b_recip[ni]) for ii in range_constexpr(4)], Float32
                         )
@@ -503,9 +539,9 @@ def compile_mxfp4_gemm_mbs(
             av = read_a(cur)
             bv = load_b(kt)
             sa_v, sb_v = load_sc(chunk_kt)
-            # This K-tile covers k_halves consecutive 128-K macro blocks,
-            # starting at kt * k_halves.
-            macro_recips = [load_mbs(kt * fx.Int32(k_halves) + fx.Int32(kh)) for kh in range_constexpr(k_halves)]
+            # This K-tile covers n_groups consecutive macro_block-sized macro
+            # blocks, starting at kt * n_groups.
+            macro_recips = [load_mbs(kt * fx.Int32(n_groups) + fx.Int32(group)) for group in range_constexpr(n_groups)]
             dma_a_to_lds(pf_kt, nxt)  # A DMA AFTER B/scale/mbs loads -> overlaps the MFMAs
             accs = compute_with_macro(accs, av, bv, sa_v, sb_v, macro_recips, scale_shift)
             if const_expr(enable_scheduler):
