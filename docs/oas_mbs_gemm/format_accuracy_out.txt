@@ -1,0 +1,19 @@
+=== Gaussian A (M=256, N=8192, K=8192) ===
+  fp8 (W8A8)            : QSNR =  28.52 dB
+  int8 (W8A8)           : QSNR =  30.25 dB
+  w4a4 (MXFP4)          : QSNR =  15.78 dB
+  w4a6 (MXFP6xMXFP4)    : QSNR =  18.49 dB
+  mbs_both_mb128        : QSNR =  16.33 dB
+  mbs_bonly_mb128       : QSNR =  16.19 dB
+  mbs_bonly_mb256       : QSNR =  16.13 dB
+
+=== Outlier-heavy A (M=256, N=8192, K=8192) ===
+  fp8 (W8A8)            : QSNR =  29.13 dB
+  int8 (W8A8)           : QSNR =  25.67 dB
+  w4a4 (MXFP4)          : QSNR =  15.80 dB
+  w4a6 (MXFP6xMXFP4)    : QSNR =  17.74 dB
+  mbs_both_mb128        : QSNR =  16.43 dB
+  mbs_bonly_mb128       : QSNR =  16.28 dB
+  mbs_bonly_mb256       : QSNR =  16.20 dB
+
+DONE.
